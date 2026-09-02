@@ -362,8 +362,8 @@ static double varerr(int sat, int sys, double el, double snr_rover,
         if (frq==2) fact*=EFACT_GPS_L5; /* GPS/QZS L5 error factor */
     }
     /* adjust variance for config parameters */
-    a=fact*opt->err[1];  /* base term */
-    b=fact*opt->err[2];  /* el term */
+    a=fact*opt->err[1];  /* base term 常数项 */
+    b=fact*opt->err[2];  /* el term 高度角项 */
     /* calculate variance */
     var=(a*a+b*b/sinel/sinel);
     if (opt->err[6]>0) {  /* add SNR term */
