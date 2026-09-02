@@ -1456,50 +1456,68 @@ extern int lsq(const double *A, const double *y, int n, int m, double *x,
 * notes  : matrix stored by column-major order (fortran convention)
 *          if state x[i]==0.0, not updates state x[i]/P[i+i*n]
 *-----------------------------------------------------------------------------*/
-static int filter_(const double *x, const double *P, const double *H,
-                   const double *v, const double *R, int n, int m,
-                   double *xp, double *Pp)
+static int filter_(
+    const double *x, /* 输入：参与本次更新的状态向量，n×1 */
+    const double *P, /* 输入：状态先验协方差，n×n */
+    const double *H, /* 输入：设计矩阵，n×m；这里存的是常见写法中 H 的转置 */
+    const double *v, /* 输入：ppp_res() 形成的“实测－预测”残差，m×1 */
+    const double *R, /* 输入：观测误差协方差，m×m */
+    int n,           /* 本次实际参与更新的状态数量 */
+    int m,           /* 有效观测残差数量 */
+    double *xp,      /* 输出：量测更新后的状态，n×1 */
+    double *Pp)      /* 输出：量测更新后的状态协方差，n×n */
 {
-    double *F=mat(n,m),*Q=mat(m,m),*K=mat(n,m),*I=eye(n);
-    int info;
+    double *F=mat(n,m); /* 临时矩阵，先存 P*H，随后可复用 */
+    double *Q=mat(m,m); /* 残差协方差 Q=H'*P*H+R，求逆后保存 Q^-1 */
+    double *K=mat(n,m); /* 卡尔曼增益 K=P*H*Q^-1 */
+    double *I=eye(n);   /* n 阶单位阵，随后变为 I-K*H' */
+    int info;           /* 矩阵求逆状态：0 成功，非 0 表示失败 */
 
-    matcpy(Q,R,m,m);
-    matcpy(xp,x,n,1);
-    matmul("NN",n,m,n,P,H,F);       /* Q=H'*P*H+R */
-    matmulp("TN",m,m,n,H,F,Q);
-    if (!(info=matinv(Q,m))) {
-        matmul("NN",n,m,m,F,Q,K);   /* K=P*H*Q^-1 */
-        matmulp("NN",n,1,m,K,v,xp);  /* xp=x+K*v */
-        matmulm("NT",n,n,m,K,H,I);  /* Pp=(I-K*H')*P */
-        matmul("NN",n,n,n,I,P,Pp);
+    matcpy(Q,R,m,m);                     /* Q 先以观测噪声矩阵 R 为初值 */
+    matcpy(xp,x,n,1);                    /* xp 先复制先验状态 x */
+    matmul("NN",n,m,n,P,H,F);           /* F=P*H，维数 n×m */
+    matmulp("TN",m,m,n,H,F,Q);          /* Q=R+H'*F=H'*P*H+R */
+    if (!(info=matinv(Q,m))) {           /* 只有 Q 可逆才能继续卡尔曼更新 */
+        matmul("NN",n,m,m,F,Q,K);       /* K=F*Q^-1=P*H*(H'*P*H+R)^-1 */
+        matmulp("NN",n,1,m,K,v,xp);     /* xp=x+K*v：用残差修正状态 */
+        matmulm("NT",n,n,m,K,H,I);      /* I=I-K*H' */
+        matmul("NN",n,n,n,I,P,Pp);      /* Pp=(I-K*H')*P：更新状态不确定度 */
     }
-    free(F); free(Q); free(K); free(I);
-    return info;
+    free(F); free(Q); free(K); free(I);  /* 释放本次矩阵运算申请的临时内存 */
+    return info;                         /* 0 表示滤波成功 */
 }
-extern int filter(double *x, double *P, const double *H, const double *v,
-                  const double *R, int n, int m)
+extern int filter(
+    double *x,       /* 输入/输出：完整状态向量 */
+    double *P,       /* 输入/输出：完整状态协方差 */
+    const double *H, /* 输入：完整设计矩阵，n×m */
+    const double *v, /* 输入：残差向量，m×1 */
+    const double *R, /* 输入：观测误差协方差，m×m */
+    int n,           /* 完整状态向量长度 */
+    int m)           /* 有效残差数量 */
 {
-    double *x_,*xp_,*P_,*Pp_,*H_;
-    int i,j,k,info,*ix;
+    double *x_,*xp_;     /* 压缩后的先验状态和更新后状态 */
+    double *P_,*Pp_,*H_; /* 压缩后的先验/后验协方差和设计矩阵 */
+    int i,j,k,info,*ix;  /* ix 保存参与更新的完整状态下标，k 是其数量 */
 
     /* create list of non-zero states */
-    ix=imat(n,1); for (i=k=0;i<n;i++) if (x[i]!=0.0&&P[i+i*n]>0.0) ix[k++]=i;
-    x_=mat(k,1); xp_=mat(k,1); P_=mat(k,k); Pp_=mat(k,k); H_=mat(k,m);
+    ix=imat(n,1); /* 最多为 n 个有效状态下标分配空间 */
+    for (i=k=0;i<n;i++) if (x[i]!=0.0&&P[i+i*n]>0.0) ix[k++]=i; /* 0 值/0 方差状态视为未启用，不参加更新 */
+    x_=mat(k,1); xp_=mat(k,1); P_=mat(k,k); Pp_=mat(k,k); H_=mat(k,m); /* 按 k 个有效状态申请紧凑矩阵 */
     /* compress array by removing zero elements to save computation time */
     for (i=0;i<k;i++) {
-        x_[i]=x[ix[i]];
-        for (j=0;j<k;j++) P_[i+j*k]=P[ix[i]+ix[j]*n];
-        for (j=0;j<m;j++) H_[i+j*k]=H[ix[i]+j*n];
+        x_[i]=x[ix[i]]; /* 从完整状态向量抽取第 ix[i] 个有效状态 */
+        for (j=0;j<k;j++) P_[i+j*k]=P[ix[i]+ix[j]*n]; /* 抽取有效状态之间的协方差子矩阵 */
+        for (j=0;j<m;j++) H_[i+j*k]=H[ix[i]+j*n];     /* 抽取设计矩阵中对应的有效状态行 */
     }
     /* do kalman filter state update on compressed arrays */
-    info=filter_(x_,P_,H_,v,R,k,m,xp_,Pp_);
+    info=filter_(x_,P_,H_,v,R,k,m,xp_,Pp_); /* 对紧凑矩阵执行真正的卡尔曼量测更新 */
     /* copy values from compressed arrays back to full arrays */
-    for (i=0;i<k;i++) {
-        x[ix[i]]=xp_[i];
-        for (j=0;j<k;j++) P[ix[i]+ix[j]*n]=Pp_[i+j*k];
+    for (i=0;i<k;i++) { /* 按 ix 映射回原完整数组，未参与状态保持不变 */
+        x[ix[i]]=xp_[i]; /* 回写更新后的状态值 */
+        for (j=0;j<k;j++) P[ix[i]+ix[j]*n]=Pp_[i+j*k]; /* 回写更新后的协方差子矩阵 */
     }
-    free(ix); free(x_); free(xp_); free(P_); free(Pp_); free(H_);
-    return info;
+    free(ix); free(x_); free(xp_); free(P_); free(Pp_); free(H_); /* 释放下标和压缩矩阵 */
+    return info; /* 0 成功；非 0 通常表示残差协方差矩阵不可逆 */
 }
 /* smoother --------------------------------------------------------------------
 * combine forward and backward filters by fixed-interval smoother as follows:
