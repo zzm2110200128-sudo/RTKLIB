@@ -113,22 +113,48 @@ def percentile(values, probability: float):
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def evaluate_solution(pos_path: Path, truth, tolerance_ms: int):
-    """评价一个 .pos 文件，返回共同历元上的内部统计量。"""
+def filter_quality(epochs, allowed_quality):
+    """只保留指定解状态（quality）的历元；allowed_quality=None 表示不过滤。
+
+    必须在时间匹配、共同历元筛选和完整时间轴插值之前调用，否则 Q=5 单点
+    回退行会作为“直接解”或插值端点污染 PPP 误差统计。
+    """
+    if allowed_quality is None:
+        return epochs
+    return [epoch for epoch in epochs if epoch["quality"] == allowed_quality]
+
+
+def evaluate_solution(pos_path: Path, truth, tolerance_ms: int, allowed_quality=6):
+    """评价一个 .pos 文件，返回共同历元上的内部统计量。
+
+    allowed_quality：只统计该 Q 状态的历元（PPP 传 6，传统 SPP 单点传 5）；
+    None 表示不过滤（仅用于检查原始记录构成）。读取时仍统计全部记录，
+    过滤后的排除数量记录在 excluded_count 中。
+    """
     solution = read_pos(pos_path)
+    raw_count = len(solution)
+    solution = filter_quality(solution, allowed_quality)
+    excluded_count = raw_count - len(solution)
     matches = match_epochs(solution, truth, tolerance_ms)
     errors = [horizontal_error_m(sol, ref) for sol, ref in matches]
 
     result = {
         "name": pos_path.stem,
         "solution": solution,
+        "raw_count": raw_count,
         "solution_count": len(solution),
+        "excluded_count": excluded_count,
+        "allowed_quality": allowed_quality,
         "matched_count": len(matches),
         "truth_coverage": len(matches) / len(truth) if truth else 0.0,
         "q6_count": sum(epoch["quality"] == 6 for epoch in solution),
         "matches": matches,
         "matched_by_time": {sol["time_ms"]: (sol, ref) for sol, ref in matches},
     }
+    if not solution:
+        result["filter_note"] = (
+            f"无 Q={allowed_quality} 历元" if allowed_quality is not None else "无有效历元"
+        )
     if errors:
         result.update(
             {
@@ -248,11 +274,12 @@ def print_comparison(results):
     )
     for result in results:
         if "score" not in result:
+            note = result.get("filter_note", "无共同历元")
             print(
                 f"{result['name']:<18} {result['solution_count']:>6} "
                 f"{result['matched_count']:>6} {result.get('evaluation_count', 0):>6} "
                 f"{result['truth_coverage']:>7.2%} "
-                f"{result['q6_count']:>6} {'无共同历元':>49}"
+                f"{result['q6_count']:>6} {note:>24}"
             )
             continue
         print(
@@ -302,13 +329,36 @@ def main():
     parser.add_argument(
         "--tolerance-ms", type=int, default=500, help="共同历元最大时间差，默认 500 ms"
     )
+    parser.add_argument(
+        "--quality",
+        type=int,
+        default=6,
+        choices=[5, 6],
+        help="只统计指定解状态的历元（PPP 用 6；传统 SPP 单点基线用 5），默认 6。"
+        "过滤在时间匹配、共同历元筛选和完整时间轴插值之前执行，Q=5 回退行不会"
+        "成为直接解或插值端点；过滤后无该状态历元时明确标记失败而不是改算其他 Q。",
+    )
     args = parser.parse_args()
 
     truth = read_ground_truth(args.truth)
     print(f"真值历元数: {len(truth)}")
-    results = [evaluate_solution(path, truth, args.tolerance_ms) for path in args.pos]
+    print(f"解状态过滤: 只保留 Q={args.quality}")
+    results = [
+        evaluate_solution(path, truth, args.tolerance_ms, allowed_quality=args.quality)
+        for path in args.pos
+    ]
     common_times = use_common_epochs(results)
     add_complete_timestamp_metrics(results, truth, args.tolerance_ms)
+
+    print("\n记录构成（过滤前总记录 / 保留 / 排除的非目标 Q）：")
+    for result in results:
+        print(
+            f"  {result['name']}: 总记录 {result['raw_count']}，"
+            f"保留 Q={result['allowed_quality']} 共 {result['solution_count']}，"
+            f"排除 {result['excluded_count']}"
+        )
+        if result.get("filter_note"):
+            print(f"    → {result['filter_note']}，该方案不参与误差统计")
 
     for result in results:
         if result["matches"]:

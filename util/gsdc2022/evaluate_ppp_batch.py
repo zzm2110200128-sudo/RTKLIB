@@ -20,6 +20,9 @@ SCHEMES = {
     "C": "C_combined.pos",
 }
 
+# 各方案允许进入误差统计的解状态：SPP 单点配置输出 Q=5；PPP 只统计 Q=6。
+QUALITY = {"SPP": 5, "A": 6, "B": 6, "C": 6}
+
 
 def infer_device(pos_path: Path):
     """从 .pos 头部记录的观测文件路径中取得手机型号。"""
@@ -59,7 +62,7 @@ def find_cases(dataset_root: Path):
 def evaluate_case(track, device, truth_path, solution_paths, tolerance_ms):
     truth = read_ground_truth(truth_path)
     results = {
-        name: evaluate_solution(path, truth, tolerance_ms)
+        name: evaluate_solution(path, truth, tolerance_ms, allowed_quality=QUALITY[name])
         for name, path in solution_paths.items()
     }
     common_times = use_common_epochs(list(results.values()))
@@ -81,14 +84,15 @@ def print_cases(rows):
     )
     for row in rows:
         label = f"{row['track']}/{row['device']}"
-        spp = row["results"]["SPP"]
-        a = row["results"]["A"]
-        b = row["results"]["B"]
-        c = row["results"]["C"]
+
+        def fmt(result):
+            score = result.get("full_score")
+            return f"{score:>10.3f}" if score is not None else f"{'无有效Q':>10}"
+
         print(
             f"{label:<57} {row['truth_count']:>6} {row['common_count']:>6} "
-            f"{spp['full_score']:>10.3f} {a['full_score']:>10.3f} "
-            f"{b['full_score']:>10.3f} {c['full_score']:>10.3f}"
+            f"{fmt(row['results']['SPP'])} {fmt(row['results']['A'])} "
+            f"{fmt(row['results']['B'])} {fmt(row['results']['C'])}"
         )
 
     print("\n逐手机原始解覆盖率（补齐前）")
@@ -105,13 +109,20 @@ def print_cases(rows):
 
 def print_overall(rows):
     print("\n总体平均（先计算每部手机的 (P50+P95)/2，再对手机取等权平均）")
+
+    def fmt_mean(values):
+        present = [v for v in values if v is not None]
+        if not present:
+            return "无有效解"
+        text = f"{mean(present):.3f} m"
+        if len(present) < len(values):
+            text += f"（{len(values) - len(present)} 组无解未计入）"
+        return text
+
     for scheme in SCHEMES:
-        complete_scores = [row["results"][scheme]["full_score"] for row in rows]
-        common_scores = [row["results"][scheme]["score"] for row in rows]
-        print(
-            f"{scheme}: 完整时间戳 {mean(complete_scores):.3f} m；"
-            f"共同历元内部 {mean(common_scores):.3f} m"
-        )
+        full = [row["results"][scheme].get("full_score") for row in rows]
+        common = [row["results"][scheme].get("score") for row in rows]
+        print(f"{scheme}: 完整时间戳 {fmt_mean(full)}；共同历元内部 {fmt_mean(common)}")
 
 
 def main():
