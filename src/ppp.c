@@ -75,6 +75,13 @@
 
 #define THRES_MW_JUMP 10.0
 
+/* E1 实验：手机码方差改用实测 C/N0 曲线（0=关闭与基线一致，1=启用）----*/
+#define PPP_CODE_CN0_VARERR 0 /* E1 负结果实验已记录（见 doc）；默认关闭，置 1 可复现 */
+#define CN0_VAR_A          79.4  /* σ=a*10^(-b*snr) 的系数：按开发集 B 态 IF(Pc) 验后码残差标定 */
+#define CN0_VAR_B          0.045 /* 每 dB-Hz 的对数斜率（候选，参数层再扫描） */
+#define CN0_VAR_MIN_SIGMA  0.25  /* 码噪声下限候选（m），冻结前做敏感性检查 */
+#define CN0_VAR_MAX_SIGMA  12.0  /* 上限，防止 C/N0 外推时方差爆炸 */
+
 #define VAR_POS     SQR(60.0)       /* init variance receiver position (m^2) */
 #define VAR_VEL     SQR(10.0)       /* init variance of receiver vel ((m/s)^2) */
 #define VAR_ACC     SQR(10.0)       /* init variance of receiver acc ((m/ss)^2) */
@@ -342,6 +349,7 @@ static double varerr(int sat, int sys, double el, double snr_rover,
     double fact=1.0;
     double sinel=sin(el),var;
     int frq,code;
+    int e1_code_var=0; /* E1 标志：1 表示本观测已使用 C/N0 曲线码方差（已含 IF 域，行尾不再 ×3） */
 
     frq=f/2;code=f%2; /* 0=phase, 1=code */
     /* increase variance for pseudoranges */
@@ -374,8 +382,20 @@ static double varerr(int sat, int sys, double el, double snr_rover,
         if (code) var+=SQR(opt->err[7]*obs->Pstd[frq]);
         else var+=SQR(opt->err[7]*obs->Lstd[frq]*0.2);
     }
+#if PPP_CODE_CN0_VARERR
+    /* E1: 手机伪距方差按实测 C/N0 曲线直接给出（IF/Pc 域，σ 已含 IF 组合
+     * 噪声放大，因此行尾的 IFLC ×3 必须跳过，否则重复放大）。仅作用于
+     * IFLC + code 观测；C/N0 缺失或异常（<=0 或 >=snr_max）时回退上面的
+     * 原公式（含 ×3），与 A 基线行为一致。相位观测不受影响。*/
+    if (code&&opt->ionoopt==IONOOPT_IFLC&&snr_rover>0.0&&snr_rover<snr_max) {
+        double sigma=CN0_VAR_A*pow(10.0,-CN0_VAR_B*snr_rover); /* 候选曲线 σ(C/N0) */
+        sigma=MAX(CN0_VAR_MIN_SIGMA,MIN(CN0_VAR_MAX_SIGMA,sigma)); /* 钳制上下限 */
+        var=SQR(sigma);  /* 直接把 IF 域码方差给滤波器 */
+        e1_code_var=1;
+    }
+#endif
     /* FIXME: the scaling factor is not 3 for other signals/constellations than GPS L1/L2 */
-    var*=(opt->ionoopt==IONOOPT_IFLC)?SQR(3.0):1.0;
+    var*=(opt->ionoopt==IONOOPT_IFLC&&!e1_code_var)?SQR(3.0):1.0;
     return var;
 }
 /* initialize state and covariance -------------------------------------------*/
