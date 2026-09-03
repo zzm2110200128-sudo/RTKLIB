@@ -14,6 +14,7 @@ from evaluate_ppp import (
 
 
 SCHEMES = {
+    "SPP": "SPP_baseline.pos",
     "A": "A_baseline.pos",
     "B": "B_cn0.pos",
     "C": "C_combined.pos",
@@ -76,19 +77,29 @@ def print_cases(rows):
     print("\n逐手机结果（分数均为米，越小越好）")
     print(
         f"{'轨迹/设备':<57} {'真值':>6} {'共同':>6} "
-        f"{'A完整':>10} {'B完整':>10} {'C完整':>10} "
-        f"{'A覆盖':>8} {'B覆盖':>8} {'C覆盖':>8}"
+        f"{'SPP完整':>10} {'A完整':>10} {'B完整':>10} {'C完整':>10}"
     )
     for row in rows:
         label = f"{row['track']}/{row['device']}"
+        spp = row["results"]["SPP"]
         a = row["results"]["A"]
         b = row["results"]["B"]
         c = row["results"]["C"]
         print(
             f"{label:<57} {row['truth_count']:>6} {row['common_count']:>6} "
-            f"{a['full_score']:>10.3f} {b['full_score']:>10.3f} {c['full_score']:>10.3f} "
-            f"{a['truth_coverage']:>7.2%} {b['truth_coverage']:>7.2%} "
-            f"{c['truth_coverage']:>7.2%}"
+            f"{spp['full_score']:>10.3f} {a['full_score']:>10.3f} "
+            f"{b['full_score']:>10.3f} {c['full_score']:>10.3f}"
+        )
+
+    print("\n逐手机原始解覆盖率（补齐前）")
+    print(f"{'轨迹/设备':<57} {'SPP':>9} {'A':>9} {'B':>9} {'C':>9}")
+    for row in rows:
+        label = f"{row['track']}/{row['device']}"
+        print(
+            f"{label:<57} "
+            + " ".join(
+                f"{row['results'][scheme]['truth_coverage']:>8.2%}" for scheme in SCHEMES
+            )
         )
 
 
