@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""把 RTKLIB PPP .pos.stat 中的 $SAT 记录提取为结构化 CSV。"""
+"""把 RTKLIB PPP .pos.stat 中的 $SAT 记录提取为结构化 CSV。
+
+字段语义（核对 src/ppp.c）：
+- 无电离层组合（IFLC）模式下 NF=1：每星每历元只输出 1 行，
+  frequency_slot 列的取值恒为打印的 j+1=1，表示唯一的 IF 组合槽位，
+  不是 L2/L5 之类的具体频点，无法据此做 L1/L5 分频统计；
+- pseudorange_residual_m 与 carrier_phase_residual_m 分别来自
+  ppp_res() 中对 IF 组合伪距 Pc（code=1）和 IF 组合相位 Lc（code=0）
+  计算的残差 resp[j]/resc[j]（j=0）。ppp_res 每历元会先做验前残差、
+  滤波后再做验后残差，数组被多次覆盖，故文件中保存的是最后一次（验后）
+  通过的值：code 列≈码噪声/多路径（m 级），phase 列被滤波几乎完全吸收，
+  通常 ≤0.001 m 甚至精确为 0，不能代表真实相位噪声；
+- vsat=1 表示该星相位残差成功入列（相位可用），与伪距可用性无关；
+- cn0_dbhz 为 L1 槽位的 C/N0（dB-Hz）。
+"""
 
 import argparse
 import csv
