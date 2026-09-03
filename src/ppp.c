@@ -75,6 +75,10 @@
 
 #define THRES_MW_JUMP 10.0
 
+/* Experimental switch for smartphone RINEX: 1=legacy LLI 1/2 reset,
+ * 0=only LLI 1 resets ambiguity; LLI 2 is retained as a quality flag. */
+#define PPP_LLI_HALFC_AS_SLIP 0
+
 #define VAR_POS     SQR(60.0)       /* init variance receiver position (m^2) */
 #define VAR_VEL     SQR(10.0)       /* init variance of receiver vel ((m/s)^2) */
 #define VAR_ACC     SQR(10.0)       /* init variance of receiver acc ((m/ss)^2) */
@@ -462,12 +466,14 @@ static void corr_meas(
 static void detslp_ll(rtk_t *rtk, const obsd_t *obs, int n)
 {
     int i,j,nf=rtk->opt.nf;
+    int slip_mask=LLI_SLIP|
+                  (PPP_LLI_HALFC_AS_SLIP?LLI_HALFC:0);
 
     trace(3,"detslp_ll: n=%d\n",n);
 
     if (nf > NFREQ) nf = NFREQ; // Quieten compiler warnings on slip[] write.
     for (i=0;i<n&&i<MAXOBS;i++) for (j=0;j<nf;j++) {
-        if (obs[i].L[j]==0.0||!(obs[i].LLI[j]&(LLI_SLIP|LLI_HALFC))) continue;
+        if (obs[i].L[j]==0.0||!(obs[i].LLI[j]&slip_mask)) continue;
 
         trace(3,"detslp_ll: slip detected sat=%2d f=%d\n",obs[i].sat,j+1);
 
