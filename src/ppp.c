@@ -83,7 +83,9 @@
 #define CN0_VAR_MAX_SIGMA  12.0  /* 上限，防止 C/N0 外推时方差爆炸 */
 
 /* E7a 实验：相位残差与质量控制诊断（0=关闭，与 B 完全一致；1=启用并写 CSV）*/
-#define PPP_PHASE_DIAG 0 /* E7a：默认关；置 1 时在 ppp_res()/pppos() 内记录相位诊断 CSV（路径取环境变量 PPP_PHASE_DIAG_OUT） */
+#ifndef PPP_PHASE_DIAG
+#define PPP_PHASE_DIAG 0 /* E7a/E7b：默认关；诊断构建用编译参数 -DPPP_PHASE_DIAG=1 临时启用 */
+#endif
 #if PPP_PHASE_DIAG
 #define PD_NEV  2                /* 每星每历元最多保留的排除历史事件数 */
 #define PD_NA   (-99)            /* int 型"不适用"哨兵值（写 CSV 时转空串） */
@@ -171,6 +173,20 @@ typedef struct {
     int    proc;        /* pd_proc_t */
     int    acc_iter;    /* 被接受迭代号（PD_NA=未接受） */
 } pd_epoch_t;
+
+/* E7b：同一预测状态/线性化下的删组重算。各组结果不是可加的因果分解，
+ * 只表示删去该组后，一步 EKF 更新相对完整更新的敏感度。 */
+#define PDU_NCF 6
+typedef enum {
+    PDU_PHASE_ONLY=0, PDU_CODE_ONLY, PDU_DROP_BIT0, PDU_DROP_HALF,
+    PDU_DROP_DETECTOR, PDU_DROP_CLEAN
+} pdu_cf_t;
+typedef struct {
+    int valid,iter,nv,nphase,ncode,nbit0,nhalf,ndetector,nclean;
+    double dx_full[3],psig_pre,psig_full;
+    int ok[PDU_NCF],nrow[PDU_NCF];
+    double dx[PDU_NCF][3],gap[PDU_NCF],psig[PDU_NCF];
+} pd_update_t;
 
 /* 在排除历史中追加事件（同一原因连续出现只记一次；新事件放最前） */
 static void pd_ev_add(pd_sat_t *p,int type,double res,int iter,int post)
@@ -298,6 +314,151 @@ static const char *pd_pn(int pr)
     case PD_PROC_OVERFLOW:    return "iter_overflow";
     default: return "";
     }
+}
+
+/* v/H 中某行的来源：0=code，1=raw bit0，2=raw half-only，
+ * 3=原始 LLI 干净但内部探测器置 slip，4=clean，-1=未知。 */
+static int pdu_row_class(int vidx,const pd_sat_t *pd,int n)
+{
+    int i,lli;
+    for (i=0;i<n&&i<MAXOBS;i++) {
+        if (!pd[i].a_entered||pd[i].a_vidx!=vidx) continue;
+        lli=pd[i].lli1|pd[i].lli2;
+        if (lli&1) return 1;
+        if (lli&2) return 2;
+        if (pd[i].slip0||pd[i].slip1) return 3;
+        return 4;
+    }
+    /* IFLC 的 ppp_res() 每星只有相位、code 两类；未命中相位 vidx 即 code。 */
+    return 0;
+}
+static double pdu_psig(const double *P,int nx)
+{
+    double s=0.0;
+    int i;
+    for (i=0;i<3;i++) if (P[i+i*nx]>0.0) s+=P[i+i*nx];
+    return SQRT(s);
+}
+/* 从相同的 x-/P- 对选择后的观测行重跑一次线性 EKF 更新。 */
+static int pdu_run_cf(int mode,const double *x0,const double *P0,
+                      const double *H,const double *v,const double *R,
+                      int nx,int nv,const pd_sat_t *pd,int n,
+                      double *dx,double *psig,int *nrow)
+{
+    double *x,*P,*Hs,*vs,*Rs;
+    int *ix,cls,i,j,m=0,keep,info;
+
+    ix=imat(nv,1);
+    for (i=0;i<nv;i++) {
+        cls=pdu_row_class(i,pd,n);
+        if      (mode==PDU_PHASE_ONLY) keep=cls>0;
+        else if (mode==PDU_CODE_ONLY)  keep=cls==0;
+        else if (mode==PDU_DROP_BIT0)  keep=cls!=1;
+        else if (mode==PDU_DROP_HALF)  keep=cls!=2;
+        else if (mode==PDU_DROP_DETECTOR) keep=cls!=3;
+        else                            keep=cls!=4;
+        if (keep) ix[m++]=i;
+    }
+    *nrow=m;
+    if (m<=0) { free(ix); return 0; }
+
+    x=mat(nx,1); P=mat(nx,nx); Hs=mat(nx,m); vs=mat(m,1); Rs=zeros(m,m);
+    matcpy(x,x0,nx,1); matcpy(P,P0,nx,nx);
+    for (j=0;j<m;j++) {
+        vs[j]=v[ix[j]];
+        for (i=0;i<nx;i++) Hs[i+j*nx]=H[i+ix[j]*nx];
+        for (i=0;i<m;i++) Rs[i+j*m]=R[ix[i]+ix[j]*nv];
+    }
+    info=filter(x,P,Hs,vs,Rs,nx,m);
+    if (!info) {
+        for (i=0;i<3;i++) dx[i]=x[i]-x0[i];
+        *psig=pdu_psig(P,nx);
+    }
+    free(ix); free(x); free(P); free(Hs); free(vs); free(Rs);
+    return info==0;
+}
+static void pdu_calc(pd_update_t *u,int iter,const double *x0,const double *P0,
+                     const double *xf,const double *Pf,const double *H,
+                     const double *v,const double *R,int nx,int nv,
+                     const pd_sat_t *pd,int n)
+{
+    int i,j,cls;
+    memset(u,0,sizeof(*u));
+    u->valid=1; u->iter=iter; u->nv=nv;
+    for (i=0;i<nv;i++) {
+        cls=pdu_row_class(i,pd,n);
+        if (cls==0) u->ncode++;
+        else {
+            u->nphase++;
+            if (cls==1) u->nbit0++;
+            else if (cls==2) u->nhalf++;
+            else if (cls==3) u->ndetector++;
+            else if (cls==4) u->nclean++;
+        }
+    }
+    for (i=0;i<3;i++) u->dx_full[i]=xf[i]-x0[i];
+    u->psig_pre=pdu_psig(P0,nx); u->psig_full=pdu_psig(Pf,nx);
+    for (j=0;j<PDU_NCF;j++) {
+        u->ok[j]=pdu_run_cf(j,x0,P0,H,v,R,nx,nv,pd,n,
+                            u->dx[j],&u->psig[j],&u->nrow[j]);
+        if (u->ok[j]) {
+            double d[3];
+            for (i=0;i<3;i++) d[i]=u->dx_full[i]-u->dx[j][i];
+            u->gap[j]=norm(d,3);
+        }
+    }
+}
+static const char *pdu_name(int i)
+{
+    static const char *name[PDU_NCF]={
+        "phase_only","code_only","drop_bit0","drop_half",
+        "drop_detector","drop_clean"
+    };
+    return name[i];
+}
+static void pdu_dump(const pd_epoch_t *e,const pd_update_t *u,
+                     const obsd_t *obs,const char *ts)
+{
+    static FILE *fp=NULL;
+    static int hdr=0;
+    int i,week;
+    double tow;
+    if (!fp) {
+        const char *path=getenv("PPP_PHASE_UPDATE_DIAG_OUT");
+        if (!path||!*path) path="phase_update_diag.csv";
+        fp=fopen(path,"w");
+    }
+    if (!fp) return;
+    if (!hdr) {
+        fprintf(fp,"week,tow,time,epoch_stat,acc_iter,nv,nphase,ncode,"
+                "n_bit0,n_half,n_detector,n_clean,"
+                "dx_full_x,dx_full_y,dx_full_z,dx_full_norm,psig_pre,psig_full");
+        for (i=0;i<PDU_NCF;i++) {
+            const char *s=pdu_name(i);
+            fprintf(fp,",%s_ok,%s_nrow,%s_dx_x,%s_dx_y,%s_dx_z,%s_dx_norm,"
+                    "%s_gap_full,%s_psig",s,s,s,s,s,s,s,s);
+        }
+        fprintf(fp,"\n"); hdr=1;
+    }
+    tow=time2gpst(obs[0].time,&week);
+    fprintf(fp,"%d,%.3f,%s,%s,%s",week,tow,ts,pd_pn(e->proc),pd_iv(e->acc_iter));
+    if (!u->valid) { /* 固定列数：前 5 列后还有 13 个主字段和 6×8 个反事实字段 */
+        for (i=0;i<13+PDU_NCF*8;i++) fprintf(fp,",");
+        fprintf(fp,"\n"); return;
+    }
+    fprintf(fp,",%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+            u->nv,u->nphase,u->ncode,u->nbit0,u->nhalf,u->ndetector,u->nclean,
+            u->dx_full[0],u->dx_full[1],u->dx_full[2],norm(u->dx_full,3),
+            u->psig_pre,u->psig_full);
+    for (i=0;i<PDU_NCF;i++) {
+        if (u->ok[i]) {
+            fprintf(fp,",1,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+                    u->nrow[i],u->dx[i][0],u->dx[i][1],u->dx[i][2],
+                    norm(u->dx[i],3),u->gap[i],u->psig[i]);
+        }
+        else fprintf(fp,",0,%d,,,,,,",u->nrow[i]);
+    }
+    fprintf(fp,"\n"); fflush(fp);
 }
 /* 每历元末把诊断记录写成一行 CSV（路径取环境变量 PPP_PHASE_DIAG_OUT，缺省 phase_diag.csv） */
 static void pd_dump_epoch(const pd_epoch_t *e,const char *ts,int ns,
@@ -1849,6 +2010,7 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
 #if PPP_PHASE_DIAG
     pd_sat_t pd_d[MAXOBS]; /* E7a：按观测下标的相位诊断记录 */
     pd_epoch_t pd_e;       /* E7a：历元级诊断 */
+    pd_update_t pdu_a,pdu_k; /* E7b：当前尝试/最终验收的一步删组重算结果 */
 #endif
     int svh[MAXOBS];      /* 每条观测对应卫星的健康状态标记 */
     int exc[MAXOBS]={0};  /* 卫星排除标记：0=暂不排除，1=排除；初始全部为 0 */
@@ -1901,6 +2063,9 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
     v=mat(nv,1);                 /* 按容量上限分配残差向量 */
     H=mat(rtk->nx,nv);           /* 按“状态数×容量上限”分配设计矩阵 */
     R=mat(nv,nv);                /* 按“容量上限×容量上限”分配观测噪声协方差矩阵 */
+#if PPP_PHASE_DIAG
+    memset(&pdu_a,0,sizeof(pdu_a)); memset(&pdu_k,0,sizeof(pdu_k));
+#endif
 
     for (i=0;i<MAX_ITER;i++) { /* 最多尝试 MAX_ITER（本版本为 8）次滤波和残差检查 */
 
@@ -1938,6 +2103,11 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
 #endif
             break; /* 滤波失败，退出本历元的迭代循环 */
         }
+#if PPP_PHASE_DIAG
+        /* E7b：从与正式更新完全相同的预测状态和线性化矩阵做只读删组重算。
+         * rtk->x/P 尚未回写，仍是本次正式 filter() 使用的 x-/P-。 */
+        pdu_calc(&pdu_a,i,rtk->x,rtk->P,xp,Pp,H,v,R,rtk->nx,nv,pd_d,n);
+#endif
         /* postfit residuals */
         if (ppp_res(i+1,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,NULL,NULL,NULL,azel
 #if PPP_PHASE_DIAG
@@ -1950,6 +2120,7 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
 #if PPP_PHASE_DIAG
             pd_e.proc=PD_PROC_PPP; pd_e.acc_iter=i;
             pd_accept(pd_d,n,exc,i);           /* 只有验收通过的迭代才复制 attempt→accepted */
+            pdu_k=pdu_a;                       /* E7b：只保留被验收迭代的删组重算 */
 #endif
             break;                             /* 已得到可接受结果，结束迭代 */
         }
@@ -2004,6 +2175,7 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
         int k,ns0=0;
         for (k=0;k<MAXSAT;k++) if (rtk->ssat[k].vsat[0]) ns0++;
         pd_dump_epoch(&pd_e,str,ns0,obs,n,pd_d);
+        pdu_dump(&pd_e,&pdu_k,obs,str); /* E7b：每历元一行，失败历元仅保留状态 */
     }
 #endif
 }
