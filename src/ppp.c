@@ -82,6 +82,9 @@
 #define CN0_VAR_MIN_SIGMA  0.25  /* 码噪声下限候选（m），冻结前做敏感性检查 */
 #define CN0_VAR_MAX_SIGMA  12.0  /* 上限，防止 C/N0 外推时方差爆炸 */
 
+/* E6a 实验：去掉显式 code 观测方程（0=关闭与 B 一致，1=启用）------------*/
+#define PPP_SKIP_CODE_UPDATE 0 /* E6a：默认关；置 1 时在 IFLC 下跳过显式 code 观测行 */
+
 #define VAR_POS     SQR(60.0)       /* init variance receiver position (m^2) */
 #define VAR_VEL     SQR(10.0)       /* init variance of receiver vel ((m/s)^2) */
 #define VAR_ACC     SQR(10.0)       /* init variance of receiver acc ((m/ss)^2) */
@@ -1139,6 +1142,17 @@ static int ppp_res(
                 /* The iono paths have already applied a slant factor. */
                 C=SQR(FREQL1/freq)*(code==0?-1.0:1.0); /* I_f=(f_L1/f)^2 I_L1，相位含 -I、伪距含 +I */
             }
+#if PPP_SKIP_CODE_UPDATE
+            /* E6a：去掉显式 code 观测方程（仅在 IFLC；放在 y 有效性检查之后、
+             * H/v 构造之前，因此只跳过“已成功形成 Pc”的 code 行，不影响
+             * Pc==0 原本就跳过的槽位）。udbias_ppp() 的 Pc 模糊度初始化/
+             * 重建与 phase-code jump 修正不在此函数内，保持原样。*/
+            if (code&&opt->ionoopt==IONOOPT_IFLC) {
+                trace(3,"E6a skip code: time=%s post=%d sat=%2d P%d\n",
+                      str,post,sat,frq+1);
+                continue;
+            }
+#endif
             if (H) {
                 for (k=0;k<nx;k++) H[k+nx*nv]=0.0; /* 先清空第 nv 条残差对应的一整列偏导 */
                 for (k=0;k<3;k++) H[k+nx*nv]=-e[k]; /* 距离对接收机 XYZ 的偏导为视线向量负值 */
