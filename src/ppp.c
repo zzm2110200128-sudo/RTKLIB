@@ -460,6 +460,71 @@ static void pdu_dump(const pd_epoch_t *e,const pd_update_t *u,
     }
     fprintf(fp,"\n"); fflush(fp);
 }
+
+/* E7c：udbias_ppp() 模糊度重建账本。 */
+typedef enum {
+    PDB_NO_BIAS=0, PDB_RETAIN, PDB_INIT_NEW, PDB_INIT_NEW_SLIP,
+    PDB_REINIT_SLIP, PDB_INIT_AFTER_CLEAR
+} pdb_action_t;
+static const char *pdb_source(const obsd_t *o,const ssat_t *s,int f2)
+{
+    int lli=o->LLI[0]|(f2>=0&&f2<NFREQ?o->LLI[f2]:0);
+    int slip=s->slip[0]|(f2>=0&&f2<NFREQ?s->slip[f2]:0);
+    if (lli&LLI_SLIP) return "raw_bit0";
+    if (lli&LLI_HALFC) return "raw_half_only";
+    if (slip) return "detector_only";
+    return "clean";
+}
+static const char *pdb_action_name(int action)
+{
+    switch (action) {
+    case PDB_NO_BIAS:          return "no_bias";
+    case PDB_RETAIN:           return "retain";
+    case PDB_INIT_NEW:         return "init_new";
+    case PDB_INIT_NEW_SLIP:    return "init_new_slip";
+    case PDB_REINIT_SLIP:      return "reinit_slip";
+    case PDB_INIT_AFTER_CLEAR: return "init_after_clear";
+    default: return "";
+    }
+}
+static void pdb_dump(gtime_t time,const obsd_t *o,const ssat_t *s,int f,int f2,
+                     int outc_entry,double x_entry,double p_entry,int cleared,
+                     double Lc,double Pc,double bias,double jump,
+                     double x_pre,double p_pre,int action,int did_init,
+                     double x_post,double p_post)
+{
+    static FILE *fp=NULL;
+    static int hdr=0;
+    char ts[40],id[8],sys='?';
+    int week,prn;
+    double tow=time2gpst(time,&week);
+    if (!fp) {
+        const char *path=getenv("PPP_BIAS_DIAG_OUT");
+        if (!path||!*path) path="bias_diag.csv";
+        fp=fopen(path,"w");
+    }
+    if (!fp) return;
+    if (!hdr) {
+        fprintf(fp,"week,tow,time,sat,sys,f,f2,lli_0,lli_f2,slip_0,slip_f2,"
+                "slip_source,outc_entry,x_entry,p_entry,cleared,Lc,Pc,bias,"
+                "jump_corr,x_pre,p_pre,action,did_init,x_post,p_post,dx_init\n");
+        hdr=1;
+    }
+    switch (satsys(o->sat,&prn)) {
+    case SYS_GPS: sys='G'; break; case SYS_GLO: sys='R'; break;
+    case SYS_GAL: sys='E'; break; case SYS_CMP: sys='C'; break;
+    case SYS_QZS: sys='J'; break; case SYS_IRN: sys='I'; break;
+    }
+    time2str(time,ts,2); satno2id(o->sat,id);
+    fprintf(fp,"%d,%.3f,%s,%s,%c,%d,%d,%d,%d,%d,%d,%s,%d,"
+            "%.6f,%.6f,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%s,%d,"
+            "%.6f,%.6f,%.6f\n",week,tow,ts,id,sys,f,f2,o->LLI[0],
+            f2>=0&&f2<NFREQ?o->LLI[f2]:0,s->slip[0],
+            f2>=0&&f2<NFREQ?s->slip[f2]:0,pdb_source(o,s,f2),outc_entry,
+            x_entry,p_entry,cleared,Lc,Pc,bias,jump,x_pre,p_pre,
+            pdb_action_name(action),did_init,x_post,p_post,x_post-x_pre);
+    fflush(fp);
+}
 /* 每历元末把诊断记录写成一行 CSV（路径取环境变量 PPP_PHASE_DIAG_OUT，缺省 phase_diag.csv） */
 static void pd_dump_epoch(const pd_epoch_t *e,const char *ts,int ns,
                           const obsd_t *obs,int n,const pd_sat_t *pd)
@@ -1333,6 +1398,13 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav) /
     int i,j,k,f,sat;               /* 循环下标、状态下标、频率下标和卫星编号 */
     int slip[MAXOBS]={0};           /* 当前历元各观测在本频率上是否发生周跳 */
     int clk_jump=0;                 /* 是否处在启用日界跳变处理的 GPS 日边界 */
+#if PPP_PHASE_DIAG
+    double pdb_xe[MAXOBS],pdb_pe[MAXOBS],pdb_lc[MAXOBS],pdb_pc[MAXOBS];
+    int pdb_outc[MAXOBS],pdb_clear[MAXOBS];
+    double pdb_jump=0.0;
+    double pdb_xpre,pdb_ppre;
+    int pdb_action,pdb_init,pdb_f2;
+#endif
 
     trace(3,"udbias  : n=%d\n",n); /* 记录本历元观测数 */
 
@@ -1354,6 +1426,15 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav) /
 
     for (f=0;f<NF(&rtk->opt);f++) { /* 逐个参与 PPP 的频率/组合处理模糊度 */
         offset=0;                    /* 每个频率重新累计公共跳变量 */
+#if PPP_PHASE_DIAG
+        pdb_jump=0.0;
+        for (i=0;i<n&&i<MAXOBS;i++) {
+            sat=obs[i].sat; j=IB(sat,f,&rtk->opt);
+            pdb_xe[i]=rtk->x[j]; pdb_pe[i]=rtk->P[j+j*rtk->nx];
+            pdb_outc[i]=(int)rtk->ssat[sat-1].outc[f]; pdb_clear[i]=0;
+            pdb_lc[i]=pdb_pc[i]=0.0;
+        }
+#endif
         /* reset phase-bias if expire obs outage counter */
         for (i=0;i<MAXSAT;i++) { /* 对所有卫星增加一次连续缺测计数 */
             if (++rtk->ssat[i].outc[f]>(uint32_t)rtk->opt.maxout||
@@ -1361,11 +1442,20 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav) /
                 initx(rtk,0.0,0.0,IB(i+1,f,&rtk->opt));   /* 将对应模糊度状态及方差清零，等待重建 */
             }
         }
+#if PPP_PHASE_DIAG
+        for (i=0;i<n&&i<MAXOBS;i++) {
+            sat=obs[i].sat; j=IB(sat,f,&rtk->opt);
+            pdb_clear[i]=pdb_xe[i]!=0.0&&rtk->x[j]==0.0;
+        }
+#endif
         for (i=k=0;i<n&&i<MAXOBS;i++) { /* 第一遍：计算各卫星模糊度初值并统计公共跳变 */
             sat=obs[i].sat;              /* 当前卫星编号 */
             j=IB(sat,f,&rtk->opt);       /* 当前卫星、当前频率的模糊度状态下标 */
             corr_meas(obs+i,nav,rtk->ssat[sat-1].azel,&rtk->opt,dantr,dants,
                       0.0,L,P,&Lc,&Pc); /* 得到以 m 为单位的相位、伪距和无电离层组合 */
+#if PPP_PHASE_DIAG
+            pdb_lc[i]=Lc; pdb_pc[i]=Pc;
+#endif
 
             bias[i]=0.0; /* 0 表示本观测暂时无法形成有效模糊度初值 */
 
@@ -1391,6 +1481,9 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav) /
         }
         /* correct phase-code jump to ensure phase-code coherence */
         if (k>=2&&fabs(offset/k)>0.0005*CLIGHT) { /* 至少两星且公共差值超过约 0.5 ms 对应距离 */
+#if PPP_PHASE_DIAG
+            pdb_jump=offset/k;
+#endif
             for (i=0;i<MAXSAT;i++) {             /* 将同一个公共跳变量加到所有有效模糊度 */
                 j=IB(i+1,f,&rtk->opt);            /* 第 i+1 颗卫星、本频率模糊度下标 */
                 if (rtk->x[j]!=0.0) rtk->x[j]+=offset/k; /* 保持相位与伪距钟的一致性 */
@@ -1404,17 +1497,36 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav) /
             j=IB(sat,f,&rtk->opt);     /* 当前模糊度状态下标 */
 
             rtk->P[j+j*rtk->nx]+=SQR(rtk->opt.prn[0])*fabs(rtk->tt); /* 随时间给模糊度对角方差加入随机游走噪声 */
+#if PPP_PHASE_DIAG
+            pdb_xpre=rtk->x[j]; pdb_ppre=rtk->P[j+j*rtk->nx]; pdb_init=0;
+            if (bias[i]==0.0) pdb_action=PDB_NO_BIAS;
+            else if (rtk->x[j]!=0.0&&!slip[i]) pdb_action=PDB_RETAIN;
+            else if (slip[i]&&pdb_xe[i]!=0.0) pdb_action=PDB_REINIT_SLIP;
+            else if (slip[i]) pdb_action=PDB_INIT_NEW_SLIP;
+            else if (pdb_clear[i]) pdb_action=PDB_INIT_AFTER_CLEAR;
+            else pdb_action=PDB_INIT_NEW;
+#endif
+            if (bias[i]!=0.0&&(rtk->x[j]==0.0||slip[i])) {
+                /* reinitialize phase-bias if detecting cycle slip */
+                initx(rtk,bias[i],VAR_BIAS,IB(sat,f,&rtk->opt)); /* 首次见星或周跳后，以新 bias 和初始方差重建 */
+                trace(3,"init bias: sat=%d frq=%d\n", sat,f);
+#if PPP_PHASE_DIAG
+                pdb_init=1;
+#endif
+                /* reset fix flags */
+                for (k=0;k<MAXSAT;k++) rtk->ambc[sat-1].flags[k]=0; /* 模糊度重置后，旧整数固定关系全部作废 */
 
-            if (bias[i]==0.0||(rtk->x[j]!=0.0&&!slip[i])) continue; /* 无初值或旧状态仍连续时无需重建 */
-
-            /* reinitialize phase-bias if detecting cycle slip */
-            initx(rtk,bias[i],VAR_BIAS,IB(sat,f,&rtk->opt)); /* 首次见星或周跳后，以新 bias 和初始方差重建 */
-            trace(3,"init bias: sat=%d frq=%d\n", sat,f);
-
-            /* reset fix flags */
-            for (k=0;k<MAXSAT;k++) rtk->ambc[sat-1].flags[k]=0; /* 模糊度重置后，旧整数固定关系全部作废 */
-
-            trace(3,"udbias_ppp: sat=%2d bias=%.3f\n",sat,bias[i]);
+                trace(3,"udbias_ppp: sat=%2d bias=%.3f\n",sat,bias[i]);
+            }
+#if PPP_PHASE_DIAG
+            pdb_f2=rtk->opt.ionoopt==IONOOPT_IFLC?
+                   seliflc(rtk->opt.nf,rtk->ssat[sat-1].sys):f;
+            pdb_dump(obs[0].time,obs+i,rtk->ssat+sat-1,f,pdb_f2,
+                     pdb_outc[i],pdb_xe[i],pdb_pe[i],pdb_clear[i],
+                     pdb_lc[i],pdb_pc[i],bias[i],pdb_jump,
+                     pdb_xpre,pdb_ppre,pdb_action,pdb_init,
+                     rtk->x[j],rtk->P[j+j*rtk->nx]);
+#endif
         }
     }
 }
