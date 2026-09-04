@@ -82,6 +82,349 @@
 #define CN0_VAR_MIN_SIGMA  0.25  /* 码噪声下限候选（m），冻结前做敏感性检查 */
 #define CN0_VAR_MAX_SIGMA  12.0  /* 上限，防止 C/N0 外推时方差爆炸 */
 
+/* E7a 实验：相位残差与质量控制诊断（0=关闭，与 B 完全一致；1=启用并写 CSV）*/
+#define PPP_PHASE_DIAG 0 /* E7a：默认关；置 1 时在 ppp_res()/pppos() 内记录相位诊断 CSV（路径取环境变量 PPP_PHASE_DIAG_OUT） */
+#if PPP_PHASE_DIAG
+#define PD_NEV  2                /* 每星每历元最多保留的排除历史事件数 */
+#define PD_NA   (-99)            /* int 型"不适用"哨兵值（写 CSV 时转空串） */
+#define PD_NAD  (-1.0E30)        /* double 型"不适用"哨兵值（写 CSV 时转空串） */
+
+/* 逐行/最终状态分类（固定枚举；输出时映射成短字符串，不用自由文本） */
+typedef enum {
+    PD_NONE=0,          /* 未记录到任何状态 */
+    PD_ENTERED,         /* 相位残差进入滤波（nv++） */
+    PD_NO_LC,           /* 无可用 IF 相位组合观测（Lc==0） */
+    PD_BIAS_NOT_INIT,   /* 模糊度状态尚未建立（x[IB]==0） */
+    PD_GEOM_EL,         /* 几何无效或低于截止高度角 */
+    PD_SAT_INVALID,     /* 系统/健康/用户排除等卫星级无效 */
+    PD_TROP_IONO,       /* 对流层或电离层模型失败 */
+    PD_PHASE_WINDUP,    /* 相位缠绕模型失败 */
+    PD_PREV_EXC,        /* 本历元先前迭代已被排除 */
+    PD_PREFIT_REJ_PHASE,/* 验前粗差立即剔除：触发观测为相位 */
+    PD_PREFIT_REJ_CODE, /* 验前粗差立即剔除：触发观测为伪距 */
+    PD_POSTFIT_SEL_PHASE,/* 验后粗差被选为最大并整星排除：触发观测为相位 */
+    PD_POSTFIT_SEL_CODE  /* 验后粗差被选为最大并整星排除：触发观测为伪距 */
+} pd_stat_t;
+
+/* 历元处理结果（epoch_stat 列） */
+typedef enum {
+    PD_PROC_NONE=0, PD_PROC_PPP, PD_PROC_NO_OBS, PD_PROC_FILTER_ERR,
+    PD_PROC_OVERFLOW
+} pd_proc_t;
+
+/* 单个排除历史事件 */
+typedef struct {
+    int    type;   /* pd_stat_t：排除/拒绝原因 */
+    double res;    /* 触发残差（m），无则 PD_NAD */
+    int    iter;   /* 迭代号（pppos 循环 i，0 起） */
+    int    post;   /* 该次 ppp_res 的 post 值 */
+} pd_ev_t;
+
+/* 每颗卫星（按观测下标）的相位诊断记录 */
+typedef struct {
+    /* ---- 历元常量：观测身份与可用性（每次触及时重填，值不变） ---- */
+    int    valid;     /* 本历元是否被 ppp_res 处理过（含仅被排除） */
+    int    sat;       /* RTKLIB 卫星号 */
+    char   sys;       /* 系统字母 G/R/E/C/J/I/'?' */
+    int    f2;        /* IFLC 第二频率槽（seliflc），非 IFLC 为 PD_NA */
+    int    raw_L1,raw_P1; /* 原始观测槽 0 的 L/P 是否存在 */
+    int    raw_L2,raw_P2; /* 原始观测槽 f2 的 L/P 是否存在 */
+    int    corr_L1,corr_L2; /* corr_meas 后槽 0/f2 相位可用性；-1=未到达 corr_meas */
+    int    corr_P1,corr_P2; /* corr_meas 后槽 0/f2 伪距可用性；-1=未到达 */
+    int    Lc_pres,Pc_pres; /* IF 组合是否形成；-1=未到达 corr_meas */
+    int    code1,code2; /* obs->code[] 信号码类型标识（槽 0/f2） */
+    float  snr1,snr2;   /* obs SNR（槽 0/f2，dBHz），缺失为 0 */
+    int    lli1,lli2;   /* obs LLI 位（槽 0/f2） */
+    int    slip0,slip1; /* ssat->slip 位（detslp_ll/gf 本历元置位，槽 0/f2） */
+    int    lock0,lock1; /* ssat->lock 计数（槽 0/f2） */
+    int    outc0,outc1; /* ssat->outc 计数（槽 0/f2） */
+    float  azdeg,eldeg; /* 方位/高度角（度） */
+    /* ---- attempt：最近一次触碰到该卫星的迭代（被排除卫星保留排除时数据） ---- */
+    int    a_iter;      /* 迭代号（PD_NA=无） */
+    int    a_post;      /* post 值（-1..8；PD_NA=无） */
+    int    a_stat;      /* pd_stat_t */
+    int    a_entered;   /* 相位行在该次 pre-fit 是否进入滤波 */
+    int    a_vidx;      /* 相位行进入滤波时的 v 下标（pre-fit 的 nv），PD_NA=未进入 */
+    double a_res_pre;   /* 滤波前残差（m），PD_NAD=无 */
+    double a_res_post;  /* 滤波后残差（m），PD_NAD=无 */
+    double a_sig_nom;   /* 名义 σ=√varerr()（m），PD_NAD=无 */
+    double a_sig_tot;   /* 总 σ=√var[nv]（含对流层/电离层/轨道钟差，m），PD_NAD=无 */
+    double a_sig_innov; /* 单行边际预测创新 σ=√(hiᵀ·P⁻·hi+Rii)（m，pre-fit，P⁻=rtk->P），PD_NAD=无 */
+    int    a_pf_over_phase; /* 该次 post-fit 中相位行超 THRES_REJECT 候选数 */
+    int    a_pf_over_code;  /* 该次 post-fit 中伪距行超 THRES_REJECT 候选数 */
+    /* ---- accepted：只有迭代被接受时才从 attempt 复制 ---- */
+    int    ok;          /* 该星是否在通过验收的迭代中被处理 */
+    int    k_iter,k_post,k_stat,k_entered;
+    int    k_vidx;
+    double k_res_pre,k_res_post,k_sig_nom,k_sig_tot,k_sig_innov;
+    /* ---- exclude history：跨迭代保留本历元排除/拒绝原因（追加式） ---- */
+    int    nev;         /* 事件数 */
+    pd_ev_t ev[PD_NEV]; /* 最近最多 PD_NEV 个事件（新者在前） */
+    /* ---- exclude trigger：最后一次把整星排除的触发类型（供 exclude_trigger 列） ---- */
+    int    trig;        /* 最后一次把整星排除的触发类型：prefit/postfit 的 rej/sel（code 或 phase），无则 PD_NONE */
+    double trig_res;    /* 触发残差 */
+    int    trig_iter,trig_post;
+} pd_sat_t;
+
+/* 历元级诊断信息 */
+typedef struct {
+    int    proc;        /* pd_proc_t */
+    int    acc_iter;    /* 被接受迭代号（PD_NA=未接受） */
+} pd_epoch_t;
+
+/* 在排除历史中追加事件（同一原因连续出现只记一次；新事件放最前） */
+static void pd_ev_add(pd_sat_t *p,int type,double res,int iter,int post)
+{
+    int i;
+    if (p->nev>0&&p->ev[0].type==type) return; /* 去重（整星排除后原因不会变） */
+    for (i=PD_NEV-1;i>0;i--) p->ev[i]=p->ev[i-1];
+    p->ev[0].type=type; p->ev[0].res=res; p->ev[0].iter=iter; p->ev[0].post=post;
+    if (p->nev<PD_NEV) p->nev++;
+    /* 最后一次把整星排除的触发类型 */
+    if (type==PD_PREFIT_REJ_PHASE||type==PD_PREFIT_REJ_CODE||
+        type==PD_POSTFIT_SEL_PHASE||type==PD_POSTFIT_SEL_CODE) {
+        p->trig=type; p->trig_res=res; p->trig_iter=iter; p->trig_post=post;
+    }
+}
+/* 每历元开始：把全部观测槽清成"无记录" */
+static void pd_epoch_init(pd_sat_t *pd,int n)
+{
+    int i,j;
+    for (i=0;i<n&&i<MAXOBS;i++) {
+        pd[i].valid=0; pd[i].f2=PD_NA;
+        pd[i].raw_L1=pd[i].raw_P1=pd[i].raw_L2=pd[i].raw_P2=0;
+        pd[i].corr_L1=pd[i].corr_L2=pd[i].corr_P1=pd[i].corr_P2=-1;
+        pd[i].Lc_pres=pd[i].Pc_pres=-1;
+        pd[i].code1=pd[i].code2=0; pd[i].snr1=pd[i].snr2=0.0f;
+        pd[i].lli1=pd[i].lli2=0; pd[i].slip0=pd[i].slip1=0;
+        pd[i].lock0=pd[i].lock1=0; pd[i].outc0=pd[i].outc1=0;
+        pd[i].azdeg=pd[i].eldeg=0.0f;
+        pd[i].a_iter=pd[i].a_post=PD_NA; pd[i].a_stat=PD_NONE;
+        pd[i].a_entered=0; pd[i].a_vidx=PD_NA;
+        pd[i].a_res_pre=pd[i].a_res_post=PD_NAD;
+        pd[i].a_sig_nom=pd[i].a_sig_tot=pd[i].a_sig_innov=PD_NAD;
+        pd[i].a_pf_over_phase=pd[i].a_pf_over_code=0;
+        pd[i].ok=0; pd[i].k_iter=pd[i].k_post=PD_NA;
+        pd[i].k_stat=PD_NONE; pd[i].k_entered=0; pd[i].k_vidx=PD_NA;
+        pd[i].k_res_pre=pd[i].k_res_post=pd[i].k_sig_nom=pd[i].k_sig_tot=pd[i].k_sig_innov=PD_NAD;
+        pd[i].nev=0; pd[i].trig=PD_NONE; pd[i].trig_res=PD_NAD;
+        pd[i].trig_iter=pd[i].trig_post=PD_NA;
+        for (j=0;j<PD_NEV;j++) { /* 事件槽必须显式初始化，防止输出未初始化内存 */
+            pd[i].ev[j].type=PD_NONE;
+            pd[i].ev[j].res=PD_NAD;
+            pd[i].ev[j].iter=pd[i].ev[j].post=PD_NA;
+        }
+    }
+}
+/* 迭代开始：未排除卫星清空 attempt（被排除卫星保留其排除时的 attempt） */
+static void pd_attempt_begin(pd_sat_t *pd,int n,const int *exc)
+{
+    int i;
+    for (i=0;i<n&&i<MAXOBS;i++) {
+        if (exc&&exc[i]) continue;
+        pd[i].a_iter=pd[i].a_post=PD_NA; pd[i].a_stat=PD_NONE;
+        pd[i].a_entered=0; pd[i].a_vidx=PD_NA;
+        pd[i].a_res_pre=pd[i].a_res_post=PD_NAD;
+        pd[i].a_sig_nom=pd[i].a_sig_tot=pd[i].a_sig_innov=PD_NAD;
+        pd[i].a_pf_over_phase=pd[i].a_pf_over_code=0;
+    }
+}
+/* 迭代验收通过：把未排除卫星的 attempt 复制到 accepted */
+static void pd_accept(pd_sat_t *pd,int n,const int *exc,int iter)
+{
+    int i;
+    for (i=0;i<n&&i<MAXOBS;i++) {
+        if (!pd[i].valid||(exc&&exc[i])) continue;
+        pd[i].ok=1;
+        pd[i].k_iter=iter; pd[i].k_post=pd[i].a_post;
+        pd[i].k_stat=pd[i].a_stat; pd[i].k_entered=pd[i].a_entered;
+        pd[i].k_vidx=pd[i].a_vidx;
+        pd[i].k_res_pre=pd[i].a_res_pre; pd[i].k_res_post=pd[i].a_res_post;
+        pd[i].k_sig_nom=pd[i].a_sig_nom; pd[i].k_sig_tot=pd[i].a_sig_tot;
+        pd[i].k_sig_innov=pd[i].a_sig_innov;
+    }
+}
+/* int/double 哨兵值转空串（空值表示"不适用"，不用 0 混充缺失）。
+ * 注意：调用方必须立即 fprintf 输出，不能在一条语句里两次调用本函数。 */
+static char pds_buf_i[32],pds_buf_d[48];
+static const char *pd_iv(int v)
+{
+    if (v==PD_NA) return "";
+    sprintf(pds_buf_i,"%d",v);
+    return pds_buf_i;
+}
+static const char *pd_dv(double v)
+{
+    if (v<=PD_NAD/2.0) return "";
+    sprintf(pds_buf_d,"%.4f",v);
+    return pds_buf_d;
+}
+/* 向行缓冲追加一个字段（自动加逗号；立即拷贝，避免静态缓冲复用冲突） */
+static void pd_putf(char *rb,int *ln,const char *s,int *first)
+{
+    int L;
+    if (!*first) rb[(*ln)++] = ',';
+    *first=0;
+    L=(int)strlen(s);
+    memcpy(rb+*ln,s,L); *ln+=L;
+    rb[*ln]='\0';
+}
+/* 状态枚举→短串（PD_NONE→空串） */
+static const char *pd_sn(int st)
+{
+    switch (st) {
+    case PD_ENTERED:          return "entered";
+    case PD_NO_LC:            return "no_lc";
+    case PD_BIAS_NOT_INIT:    return "bias_not_init";
+    case PD_GEOM_EL:          return "geom_el";
+    case PD_SAT_INVALID:      return "sat_invalid";
+    case PD_TROP_IONO:        return "trop_iono";
+    case PD_PHASE_WINDUP:     return "phase_windup";
+    case PD_PREV_EXC:         return "prev_exc";
+    case PD_PREFIT_REJ_PHASE: return "prefit_rej_phase";
+    case PD_PREFIT_REJ_CODE:  return "prefit_rej_code";
+    case PD_POSTFIT_SEL_PHASE:return "postfit_sel_phase";
+    case PD_POSTFIT_SEL_CODE: return "postfit_sel_code";
+    default: return "";
+    }
+}
+/* 历元处理结果→短串 */
+static const char *pd_pn(int pr)
+{
+    switch (pr) {
+    case PD_PROC_PPP:         return "ppp_ok";
+    case PD_PROC_NO_OBS:      return "no_valid_obs";
+    case PD_PROC_FILTER_ERR:  return "filter_error";
+    case PD_PROC_OVERFLOW:    return "iter_overflow";
+    default: return "";
+    }
+}
+/* 每历元末把诊断记录写成一行 CSV（路径取环境变量 PPP_PHASE_DIAG_OUT，缺省 phase_diag.csv） */
+static void pd_dump_epoch(const pd_epoch_t *e,const char *ts,int ns,
+                          const obsd_t *obs,int n,const pd_sat_t *pd)
+{
+    static FILE *fp=NULL;
+    static int hdr=0;
+    int i,j,week,ln,first;
+    double tow;
+    char rb[4096],tmp[96],id[8];
+    if (!fp) {
+        const char *path=getenv("PPP_PHASE_DIAG_OUT");
+        if (!path||!*path) path="phase_diag.csv";
+        fp=fopen(path,"w");
+    }
+    if (!fp) return;
+    if (!hdr) {
+        hdr=1;
+        fprintf(fp,"week,tow,time,epoch_stat,acc_iter,ns_phase,idx,sat,sys,f2,"
+                "raw_L1,raw_P1,corr_L1,raw_L2,raw_P2,corr_L2,Lc,Pc,"
+                "code1,code2,snr_L1,snr_L2,lli_L1,lli_L2,"
+                "slip_0,slip_1,lock_0,lock_1,outc_0,outc_1,az,el,"
+                "state,a_iter,a_post,a_stat,a_entered,"
+                "a_vidx,"
+                "a_res_pre,a_res_post,a_sig_nom,a_sig_tot,a_sig_innov,"
+                "a_pf_over_phase,a_pf_over_code,"
+                "k_iter,k_post,k_stat,k_entered,"
+                "k_vidx,"
+                "k_res_pre,k_res_post,k_sig_nom,k_sig_tot,k_sig_innov,"
+                "exclude_trigger,exclude_res,exclude_iter,exclude_post,nev,"
+                "ev1_type,ev1_iter,ev1_post,ev1_res,"
+                "ev2_type,ev2_iter,ev2_post,ev2_res\n");
+    }
+    tow=time2gpst(obs[0].time,&week);
+    for (i=0;i<n&&i<MAXOBS;i++) {
+        const pd_sat_t *q=&pd[i];
+        if (!q->valid) continue;
+        ln=0; first=1; rb[0]='\0';
+        sprintf(tmp,"%d",week);                      pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%.3f",tow);                     pd_putf(rb,&ln,tmp,&first);
+        pd_putf(rb,&ln,ts,&first);
+        pd_putf(rb,&ln,pd_pn(e->proc),&first);
+        pd_putf(rb,&ln,pd_iv(e->acc_iter),&first);
+        sprintf(tmp,"%d",ns);                        pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",i);                         pd_putf(rb,&ln,tmp,&first);
+        satno2id(q->sat,id);                         pd_putf(rb,&ln,id,&first);
+        sprintf(tmp,"%c",q->sys?q->sys:'?');         pd_putf(rb,&ln,tmp,&first);
+        pd_putf(rb,&ln,pd_iv(q->f2),&first);
+        sprintf(tmp,"%d",q->raw_L1);                 pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->raw_P1);                 pd_putf(rb,&ln,tmp,&first);
+        pd_putf(rb,&ln,pd_iv(q->corr_L1),&first);
+        sprintf(tmp,"%d",q->raw_L2);                 pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->raw_P2);                 pd_putf(rb,&ln,tmp,&first);
+        pd_putf(rb,&ln,pd_iv(q->corr_L2),&first);
+        pd_putf(rb,&ln,pd_iv(q->Lc_pres),&first);
+        pd_putf(rb,&ln,pd_iv(q->Pc_pres),&first);
+        sprintf(tmp,"%d",q->code1);                  pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->code2);                  pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%.1f",q->snr1);                 pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%.1f",q->snr2);                 pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->lli1);                   pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->lli2);                   pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->slip0);                  pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->slip1);                  pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->lock0);                  pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->lock1);                  pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->outc0);                  pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->outc1);                  pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%.1f",q->azdeg);                pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%.1f",q->eldeg);                pd_putf(rb,&ln,tmp,&first);
+        /* state：最终状态（优先 accepted 进入→其次排除触发→其次最近状态） */
+        if (q->ok&&q->k_entered)      pd_putf(rb,&ln,pd_sn(PD_ENTERED),&first);
+        else if (q->trig!=PD_NONE)    pd_putf(rb,&ln,pd_sn(q->trig),&first);
+        else if (q->ok)               pd_putf(rb,&ln,pd_sn(q->k_stat),&first);
+        else                          pd_putf(rb,&ln,pd_sn(q->a_stat),&first);
+        pd_putf(rb,&ln,pd_iv(q->a_iter),&first);
+        pd_putf(rb,&ln,pd_iv(q->a_post),&first);
+        pd_putf(rb,&ln,pd_sn(q->a_stat),&first);
+        sprintf(tmp,"%d",q->a_entered);              pd_putf(rb,&ln,tmp,&first);
+        pd_putf(rb,&ln,pd_iv(q->a_vidx),&first);
+        pd_putf(rb,&ln,pd_dv(q->a_res_pre),&first);
+        pd_putf(rb,&ln,pd_dv(q->a_res_post),&first);
+        pd_putf(rb,&ln,pd_dv(q->a_sig_nom),&first);
+        pd_putf(rb,&ln,pd_dv(q->a_sig_tot),&first);
+        pd_putf(rb,&ln,pd_dv(q->a_sig_innov),&first);
+        sprintf(tmp,"%d",q->a_pf_over_phase);        pd_putf(rb,&ln,tmp,&first);
+        sprintf(tmp,"%d",q->a_pf_over_code);         pd_putf(rb,&ln,tmp,&first);
+        pd_putf(rb,&ln,pd_iv(q->k_iter),&first);
+        pd_putf(rb,&ln,pd_iv(q->k_post),&first);
+        pd_putf(rb,&ln,pd_sn(q->k_stat),&first);
+        sprintf(tmp,"%d",q->k_entered);              pd_putf(rb,&ln,tmp,&first);
+        pd_putf(rb,&ln,pd_iv(q->k_vidx),&first);
+        pd_putf(rb,&ln,pd_dv(q->k_res_pre),&first);
+        pd_putf(rb,&ln,pd_dv(q->k_res_post),&first);
+        pd_putf(rb,&ln,pd_dv(q->k_sig_nom),&first);
+        pd_putf(rb,&ln,pd_dv(q->k_sig_tot),&first);
+        pd_putf(rb,&ln,pd_dv(q->k_sig_innov),&first);
+        /* exclude_trigger：code/phase（空=无排除触发） */
+        if      (q->trig==PD_PREFIT_REJ_CODE||q->trig==PD_POSTFIT_SEL_CODE)
+            pd_putf(rb,&ln,"code",&first);
+        else if (q->trig==PD_PREFIT_REJ_PHASE||q->trig==PD_POSTFIT_SEL_PHASE)
+            pd_putf(rb,&ln,"phase",&first);
+        else    pd_putf(rb,&ln,"",&first);
+        pd_putf(rb,&ln,pd_dv(q->trig_res),&first);
+        pd_putf(rb,&ln,pd_iv(q->trig_iter),&first);
+        pd_putf(rb,&ln,pd_iv(q->trig_post),&first);
+        sprintf(tmp,"%d",q->nev);                    pd_putf(rb,&ln,tmp,&first);
+        for (j=0;j<PD_NEV;j++) {
+            if (j<q->nev) { /* 只有已记录的事件才输出；未使用槽一律空字段 */
+                const pd_ev_t *ev=&q->ev[j];
+                pd_putf(rb,&ln,pd_sn(ev->type),&first);
+                pd_putf(rb,&ln,pd_iv(ev->iter),&first);
+                pd_putf(rb,&ln,pd_iv(ev->post),&first);
+                pd_putf(rb,&ln,pd_dv(ev->res),&first);
+            }
+            else {
+                pd_putf(rb,&ln,"",&first);
+                pd_putf(rb,&ln,"",&first);
+                pd_putf(rb,&ln,"",&first);
+                pd_putf(rb,&ln,"",&first);
+            }
+        }
+        fprintf(fp,"%s\n",rb);
+    }
+}
+#endif
+
 #define VAR_POS     SQR(60.0)       /* init variance receiver position (m^2) */
 #define VAR_VEL     SQR(10.0)       /* init variance of receiver vel ((m/s)^2) */
 #define VAR_ACC     SQR(10.0)       /* init variance of receiver acc ((m/ss)^2) */
@@ -1060,7 +1403,12 @@ static int ppp_res(
     double *v,             /* 输出：有效观测的残差向量 */
     double *H,             /* 输出：设计矩阵，按“状态数 × 残差数”列优先存储 */
     double *R,             /* 输出：观测误差协方差矩阵 */
-    double *azel)          /* 输出：每颗卫星的方位角、高度角 */
+    double *azel           /* 输出：每颗卫星的方位角、高度角 */
+#if PPP_PHASE_DIAG
+    , pd_sat_t *pd         /* E7a：相位诊断记录（按观测下标），可为 NULL */
+    , int pd_iter          /* E7a：当前迭代号（pppos 循环 i，0 起） */
+#endif
+    )
 {
     prcopt_t *opt=&rtk->opt; /* 处理选项的简写指针 */
     double y;                /* 当前参与计算的载波相位或伪距观测值，单位 m */
@@ -1091,21 +1439,77 @@ static int ppp_res(
 
     for (i=0;i<n&&i<MAXOBS;i++) { /* 逐颗卫星构造相位和伪距残差 */
         sat=obs[i].sat;            /* RTKLIB 内部卫星编号 */
+#if PPP_PHASE_DIAG
+        /* E7a：记录历元常量观测信息（每次触及时重填，值不变） */
+        if (pd&&pd_iter>=0) {
+            int sy0=satsys(sat,NULL);
+            pd[i].valid=1;
+            pd[i].sat=sat;
+            pd[i].sys=(char)((sy0==SYS_GPS)?'G':(sy0==SYS_GLO)?'R':(sy0==SYS_GAL)?'E':
+                             (sy0==SYS_CMP)?'C':(sy0==SYS_QZS)?'J':(sy0==SYS_IRN)?'I':'?');
+            pd[i].f2=(opt->ionoopt==IONOOPT_IFLC&&sy0)?seliflc(opt->nf,sy0):PD_NA;
+            pd[i].raw_L1=obs[i].L[0]!=0.0?1:0;
+            pd[i].raw_P1=obs[i].P[0]!=0.0?1:0;
+            pd[i].code1=obs[i].code[0];
+            pd[i].snr1=obs[i].SNR[0];
+            pd[i].lli1=obs[i].LLI[0];
+            pd[i].slip0=rtk->ssat[sat-1].slip[0];
+            pd[i].lock0=(int)rtk->ssat[sat-1].lock[0];
+            pd[i].outc0=(int)rtk->ssat[sat-1].outc[0];
+            if (pd[i].f2>=0&&pd[i].f2<NFREQ) {
+                pd[i].raw_L2=obs[i].L[pd[i].f2]!=0.0?1:0;
+                pd[i].raw_P2=obs[i].P[pd[i].f2]!=0.0?1:0;
+                pd[i].code2=obs[i].code[pd[i].f2];
+                pd[i].snr2=obs[i].SNR[pd[i].f2];
+                pd[i].lli2=obs[i].LLI[pd[i].f2];
+                pd[i].slip1=rtk->ssat[sat-1].slip[pd[i].f2];
+                pd[i].lock1=(int)rtk->ssat[sat-1].lock[pd[i].f2];
+                pd[i].outc1=(int)rtk->ssat[sat-1].outc[pd[i].f2];
+            }
+        }
+#endif
 
         /* line-of-sight vector from receiver to satellite */
         if ((r=geodist(rs+i*6,rr,e))<=0.0|| /* 计算几何距离 r 和视线单位向量 e */
             satazel(pos,e,azel+i*2)<opt->elmin) { /* 计算方位/高度角并检查截止高度角 */
             exc[i]=1;                            /* 几何无效或高度角太低，排除整颗卫星 */
+#if PPP_PHASE_DIAG
+            if (pd&&pd_iter>=0) {
+                pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                pd[i].a_stat=PD_GEOM_EL;
+                pd_ev_add(&pd[i],PD_GEOM_EL,PD_NAD,pd_iter,post);
+            }
+#endif
             continue;
         }
+#if PPP_PHASE_DIAG
+        if (pd&&pd_iter>=0) { /* 几何通过后才有可靠的 az/el */
+            pd[i].azdeg=(float)(azel[i*2]*R2D);
+            pd[i].eldeg=(float)(azel[1+i*2]*R2D);
+        }
+#endif
         if (!(sys=satsys(sat,NULL))||!rtk->ssat[sat-1].vs||
             satexclude(sat,var_rs[i],svh[i],opt)||exc[i]) { /* 检查系统、卫星位置、健康和用户排除设置 */
+#if PPP_PHASE_DIAG
+            if (pd&&pd_iter>=0&&!exc[i]) { /* exc[i]==0：本轮新排除；先前已排除则原因已在历史中 */
+                pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                pd[i].a_stat=PD_SAT_INVALID;
+                pd_ev_add(&pd[i],PD_SAT_INVALID,PD_NAD,pd_iter,post);
+            }
+#endif
             exc[i]=1;                                  /* 任一检查失败就排除该卫星 */
             continue;
         }
         /* tropospheric and ionospheric model */
         if (!model_trop(obs[i].time,pos,azel+i*2,opt,x,dtdx,nav,&dtrp,&vart)|| /* 算对流层延迟、方差和状态偏导 */
             !model_iono(obs[i].time,pos,azel+i*2,opt,sat,x,nav,&dion,&vari)) { /* 算电离层延迟及方差 */
+#if PPP_PHASE_DIAG
+            if (pd&&pd_iter>=0) {
+                pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                pd[i].a_stat=PD_TROP_IONO;
+                pd_ev_add(&pd[i],PD_TROP_IONO,PD_NAD,pd_iter,post);
+            }
+#endif
             continue;
         }
         /* satellite and receiver antenna model */
@@ -1115,11 +1519,31 @@ static int ppp_res(
         /* phase windup model */
         if (!model_phw(rtk->sol.time,sat,nav->pcvs[sat-1].type,
                        opt->posopt[2]?2:0,rs+i*6,rr,&rtk->ssat[sat-1].phw)) {
+#if PPP_PHASE_DIAG
+            if (pd&&pd_iter>=0) {
+                pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                pd[i].a_stat=PD_PHASE_WINDUP;
+                pd_ev_add(&pd[i],PD_PHASE_WINDUP,PD_NAD,pd_iter,post);
+            }
+#endif
             continue;
         }
         /* corrected phase and code measurements */
         corr_meas(obs+i,nav,azel+i*2,&rtk->opt,dantr,dants,
                   rtk->ssat[sat-1].phw,L,P,&Lc,&Pc); /* 把原始观测改正并统一为 m */
+#if PPP_PHASE_DIAG
+        if (pd&&pd_iter>=0) { /* corr_meas 后的各频可用性 */
+            int f2c=pd[i].f2;
+            pd[i].corr_L1=L[0]!=0.0?1:0;
+            pd[i].corr_P1=P[0]!=0.0?1:0;
+            pd[i].Lc_pres=Lc!=0.0?1:0;
+            pd[i].Pc_pres=Pc!=0.0?1:0;
+            if (f2c>=0&&f2c<NFREQ) {
+                pd[i].corr_L2=L[f2c]!=0.0?1:0;
+                pd[i].corr_P2=P[f2c]!=0.0?1:0;
+            }
+        }
+#endif
 
         /* stack phase and code residuals {L1,P1,L2,P2,...} */
         for (j=0;j<2*NF(opt);j++) { /* 顺序为 L1、P1、L2、P2…… */
@@ -1130,10 +1554,26 @@ static int ppp_res(
             frq=j/2;      /* j=0/1 对应频率 0，j=2/3 对应频率 1 */
 
             if (opt->ionoopt==IONOOPT_IFLC) { /* 无电离层组合模式只使用 Lc/Pc */
-                if ((y=code==0?Lc:Pc)==0.0) continue; /* 缺少组合观测就跳过 */
+                if ((y=code==0?Lc:Pc)==0.0) { /* 缺少组合观测就跳过 */
+#if PPP_PHASE_DIAG
+                    if (code==0&&pd&&pd_iter>=0) {
+                        pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                        pd[i].a_stat=PD_NO_LC;
+                    }
+#endif
+                    continue;
+                }
             }
             else {
-                if ((y=code==0?L[frq]:P[frq])==0.0) continue; /* 非组合模式取当前频率 L/P */
+                if ((y=code==0?L[frq]:P[frq])==0.0) { /* 非组合模式取当前频率 L/P */
+#if PPP_PHASE_DIAG
+                    if (code==0&&pd&&pd_iter>=0) {
+                        pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                        pd[i].a_stat=PD_NO_LC;
+                    }
+#endif
+                    continue;
+                }
 
                 if ((freq=sat2freq(sat,obs[i].code[frq],nav))==0.0) continue; /* 观测码无法映射到频率则跳过 */
                 /* The iono paths have already applied a slant factor. */
@@ -1174,7 +1614,15 @@ static int ppp_res(
                 if (H) H[ID(opt)+nx*nv]=1.0;       /* 对该 DCB 状态的偏导为 +1 */
             }
             if (code==0) { /* phase bias */
-                if ((bias=x[IB(sat,frq,opt)])==0.0) continue; /* 相位必须已有本星本频率模糊度状态 */
+                if ((bias=x[IB(sat,frq,opt)])==0.0) { /* 相位必须已有本星本频率模糊度状态 */
+#if PPP_PHASE_DIAG
+                    if (pd&&pd_iter>=0) {
+                        pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                        pd[i].a_stat=PD_BIAS_NOT_INIT;
+                    }
+#endif
+                    continue;
+                }
                 if (H) H[IB(sat,frq,opt)+nx*nv]=1.0;          /* 相位预测值对模糊度的偏导为 +1 */
             }
             /* residual */
@@ -1193,6 +1641,18 @@ static int ppp_res(
 
             trace(3,"%s post=%2d sat=%2d %s%d res=%9.4f sig=%9.4f el=%4.1f\n",
                   str,post,sat,code?"P":"L",frq+1,res,sqrt(var[nv]),azel[1+i*2]*R2D);
+#if PPP_PHASE_DIAG
+            if (pd&&pd_iter>=0&&code==0) { /* E7a：相位行验前/验后残差与 σ（重算 varerr 仅诊断用） */
+                double ve_sig2;
+                pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                if (H)      pd[i].a_res_pre=res;  /* 滤波前（pre-fit pass，x=预测状态） */
+                else        pd[i].a_res_post=res; /* 滤波后（post-fit pass，x=更新后状态） */
+                ve_sig2=varerr(sat,sys,azel[1+i*2],rtk->ssat[sat-1].snr_rover[frq],
+                               j,opt,obs+i);
+                pd[i].a_sig_nom=SQRT(ve_sig2);
+                pd[i].a_sig_tot=SQRT(ve_sig2+vart+SQR(C)*vari+var_rs[i]);
+            }
+#endif
 
             /* reject satellite by pre-fit residuals */
             double maxinno = (post==-1?1000:1)*opt->maxinno[code]; /* 初始粗定位阶段放宽 1000 倍，避免过早删星 */
@@ -1200,13 +1660,49 @@ static int ppp_res(
                 trace(2,"outlier (%d) rejected %s sat=%2d %s%d res=%9.4f el=%4.1f\n",
                       post,str,sat,code?"P":"L",frq+1,res,azel[1+i*2]*R2D);
                 exc[i]=1; rtk->ssat[sat-1].rejc[frq]++; /* 先验残差过大：立即排除该卫星并累计拒绝次数 */
+#if PPP_PHASE_DIAG
+                if (pd&&pd_iter>=0) { /* E7a：验前剔除（整星排除触发源记入 exclude_trigger） */
+                    pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                    if (code==0) { pd[i].a_stat=PD_PREFIT_REJ_PHASE; pd[i].a_res_pre=res; }
+                    pd_ev_add(&pd[i],code==0?PD_PREFIT_REJ_PHASE:PD_PREFIT_REJ_CODE,
+                              res,pd_iter,post);
+                }
+#endif
                 continue;
             }
             /* record large post-fit residuals */
             if (post>0&&fabs(res)>sqrt(var[nv])*THRES_REJECT) {
                 obsi[ne]=i; frqi[ne]=j; ve[ne]=res; ne++; /* 记录超限后验残差，稍后只剔除最大的一条 */
+#if PPP_PHASE_DIAG
+                if (pd&&pd_iter>=0) { /* E7a：验后超限候选（是否最终被选由 post-loop 决定） */
+                    pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                    if (code==0) pd[i].a_pf_over_phase++;
+                    else         pd[i].a_pf_over_code++;
+                }
+#endif
             }
             if (code==0) rtk->ssat[sat-1].vsat[frq]=1; /* 相位残差成功入列，标记该星该频率有效 */
+#if PPP_PHASE_DIAG
+            if (pd&&pd_iter>=0&&code==0&&H) { /* E7a：相位行真正进入滤波（仅 pre-fit pass） */
+                int m2;
+                double hp=0.0;
+                pd[i].a_iter=pd_iter; pd[i].a_post=post;
+                pd[i].a_stat=PD_ENTERED; pd[i].a_entered=1;
+                pd[i].a_vidx=nv; /* 该行在 v/H 中的下标 */
+                /* 单行边际预测创新 σ=√(hiᵀ·P⁻·hi+Rii)；
+                 * pre-fit 阶段 rtk->P 仍是预测协方差（P⁻），Rii=var[nv]。
+                 * 注意：这是单行边际量，各观测相关时不等同于完整 NIS。 */
+                for (k=0;k<nx;k++) {
+                    double hk=H[k+nx*nv];
+                    if (hk==0.0) continue;
+                    for (m2=0;m2<nx;m2++) {
+                        double hm=H[m2+nx*nv];
+                        if (hm!=0.0) hp+=hk*rtk->P[m2+nx*k]*hm; /* P 列主序：P(行m2,列k) */
+                    }
+                }
+                pd[i].a_sig_innov=SQRT(hp+var[nv]);
+            }
+#endif
             nv++; /* 有效残差数加一；下一条观测使用 v/H/var 的下一个位置 */
         }
     }
@@ -1221,6 +1717,15 @@ static int ppp_res(
         trace(2,"outlier (%d) rejected %s sat=%2d %s%d res=%9.4f el=%4.1f\n",
               post,str,sat,maxfrq%2?"P":"L",maxfrq/2+1,vmax,azel[1+maxobs*2]*R2D);
         exc[maxobs]=1; rtk->ssat[sat-1].rejc[maxfrq%2]++; stat=0; /* 排除其整颗卫星，并要求外层重新滤波 */
+#if PPP_PHASE_DIAG
+        if (pd&&pd_iter>=0) { /* E7a：验后粗差最终被选（postfit_selected），与候选区分 */
+            int ph=(maxfrq%2==0); /* j 偶数=相位，奇数=伪距 */
+            pd[maxobs].a_iter=pd_iter; pd[maxobs].a_post=post;
+            if (ph) pd[maxobs].a_res_post=vmax;
+            pd_ev_add(&pd[maxobs],ph?PD_POSTFIT_SEL_PHASE:PD_POSTFIT_SEL_CODE,
+                      vmax,pd_iter,post);
+        }
+#endif
         ve[rej]=0; /* 当前局部列表中清掉已选中的粗差值 */
     }
     if (R) {
@@ -1341,6 +1846,10 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
     int i,j;              /* 循环计数器 */
     int nv;               /* 当前建立出的有效残差（观测方程）数量 */
     int info;             /* filter() 的返回码：0 表示正常，非 0 表示滤波失败 */
+#if PPP_PHASE_DIAG
+    pd_sat_t pd_d[MAXOBS]; /* E7a：按观测下标的相位诊断记录 */
+    pd_epoch_t pd_e;       /* E7a：历元级诊断 */
+#endif
     int svh[MAXOBS];      /* 每条观测对应卫星的健康状态标记 */
     int exc[MAXOBS]={0};  /* 卫星排除标记：0=暂不排除，1=排除；初始全部为 0 */
     int stat=SOLQ_SINGLE; /* 当前解状态先设为单点解，PPP 成功后再升级为 PPP 解 */
@@ -1395,6 +1904,11 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
 
     for (i=0;i<MAX_ITER;i++) { /* 最多尝试 MAX_ITER（本版本为 8）次滤波和残差检查 */
 
+#if PPP_PHASE_DIAG
+        pd_e.proc=PD_PROC_NONE; pd_e.acc_iter=PD_NA; /* 历元级状态初始化（每次循环重设，验收时再置 PPP） */
+        if (i==0) pd_epoch_init(pd_d,n);             /* 仅首个迭代清空全部观测槽 */
+        pd_attempt_begin(pd_d,n,exc);                /* 未排除卫星清空 attempt，被排除卫星保留其排除数据 */
+#endif
         matcpy(xp,rtk->x,rtk->nx,1);           /* 把正式预测状态 rtk->x 复制到临时状态 xp */
         matcpy(Pp,rtk->P,rtk->nx,rtk->nx);     /* 把正式协方差 rtk->P 复制到临时协方差 Pp */
 
@@ -1405,30 +1919,55 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
          * NOTE: use different limit for pre-fit residuals in first iteration
          *       by using argument post = -1
          */
-        if (!(nv=ppp_res(i==0?-1:0,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel))) { /* 建立验前残差及 H、R；nv=0 表示没有有效观测 */
+        if (!(nv=ppp_res(i==0?-1:0,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,v,H,R,azel
+#if PPP_PHASE_DIAG
+                          ,pd_d,i
+#endif
+                          ))) { /* 建立验前残差及 H、R；nv=0 表示没有有效观测 */
             trace(2,"%s ppp (%d) no valid obs data\n",str,i+1); /* 在日志中记录时间和第几次尝试没有有效观测 */
+#if PPP_PHASE_DIAG
+            pd_e.proc=PD_PROC_NO_OBS;
+#endif
             break; /* 退出最多 8 次的滤波迭代循环，不再继续本历元的 PPP 更新，但仍可处理下一个历元。*/
         }
         /* measurement update of ekf states */
         if ((info=filter(xp,Pp,H,v,R,rtk->nx,nv))) { /* 用 H、v、R 更新 xp、Pp；返回 0 成功，非 0 失败 */
             trace(2,"%s ppp (%d) filter error info=%d\n",str,i+1,info); /* 记录滤波失败的尝试次数和错误码 */
+#if PPP_PHASE_DIAG
+            pd_e.proc=PD_PROC_FILTER_ERR;
+#endif
             break; /* 滤波失败，退出本历元的迭代循环 */
         }
         /* postfit residuals */
-        if (ppp_res(i+1,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,NULL,NULL,NULL,azel)) { /* 用滤波后的 xp 计算验后残差；通过检查时返回真 */
+        if (ppp_res(i+1,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,NULL,NULL,NULL,azel
+#if PPP_PHASE_DIAG
+                    ,pd_d,i
+#endif
+                    )) { /* 用滤波后的 xp 计算验后残差；通过检查时返回真 */
             matcpy(rtk->x,xp,rtk->nx,1);       /* 验后检查通过：把临时状态 xp 写回正式状态 rtk->x */
             matcpy(rtk->P,Pp,rtk->nx,rtk->nx); /* 把临时协方差 Pp 写回正式协方差 rtk->P */
             stat=SOLQ_PPP;                     /* 将本历元解状态标记为 PPP 浮点解 */
+#if PPP_PHASE_DIAG
+            pd_e.proc=PD_PROC_PPP; pd_e.acc_iter=i;
+            pd_accept(pd_d,n,exc,i);           /* 只有验收通过的迭代才复制 attempt→accepted */
+#endif
             break;                             /* 已得到可接受结果，结束迭代 */
         }
     }
     if (i>=MAX_ITER) { /* 循环自然结束且 i 达到上限，表示 8 次尝试都没有得到可接受结果 */
         trace(2,"%s ppp (%d) iteration overflows\n",str,i); /* 在日志中记录本历元 PPP 迭代超限 */
+#if PPP_PHASE_DIAG
+        pd_e.proc=PD_PROC_OVERFLOW;
+#endif
     }
     if (stat==SOLQ_PPP) { /* 只有先得到可接受的 PPP 浮点解，才尝试固定载波相位模糊度 */
 
         if (ppp_ar(rtk,obs,n,exc,nav,azel,xp,Pp)&& /* 尝试生成固定解；但本仓库该函数目前固定返回 0 */
-            ppp_res(9,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,NULL,NULL,NULL,azel)) { /* 若固定成功，再检查固定解的验后残差 */
+            ppp_res(9,obs,n,rs,dts,var,svh,dr,exc,nav,xp,rtk,NULL,NULL,NULL,azel
+#if PPP_PHASE_DIAG
+                    ,NULL,-1 /* E7a：固定解复检 pass 不参与诊断（本仓库 ppp_ar 恒为 0，不会到达） */
+#endif
+                    )) { /* 若固定成功，再检查固定解的验后残差 */
 
             matcpy(rtk->xa,xp,rtk->nx,1);       /* 保存通过残差检查的固定候选状态 */
             matcpy(rtk->Pa,Pp,rtk->nx,rtk->nx); /* 保存固定候选状态的协方差矩阵 */
@@ -1460,4 +1999,11 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
     free(v);    /* 释放残差向量 */
     free(H);    /* 释放设计矩阵 */
     free(R);    /* 释放观测噪声协方差矩阵 */
+#if PPP_PHASE_DIAG
+    { /* E7a：历元末落盘（成功与失败历元都记录；ns=相位有效星数） */
+        int k,ns0=0;
+        for (k=0;k<MAXSAT;k++) if (rtk->ssat[k].vsat[0]) ns0++;
+        pd_dump_epoch(&pd_e,str,ns0,obs,n,pd_d);
+    }
+#endif
 }
