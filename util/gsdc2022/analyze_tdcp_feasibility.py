@@ -209,6 +209,8 @@ def build_pairs(observations):
                     "diff": diff, "state1": previous["state"], "state2": obs["state"],
                     "adr1": previous["adr"], "adr2": obs["adr"],
                     "rate1": previous["rate"], "rate2": obs["rate"],
+                    "adr_unc1": previous["adr_unc"], "adr_unc2": obs["adr_unc"],
+                    "clock1": previous["clock"], "clock2": obs["clock"],
                 }
             )
         if arc_start is not None:

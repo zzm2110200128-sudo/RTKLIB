@@ -86,6 +86,12 @@
 #ifndef PPP_PHASE_DIAG
 #define PPP_PHASE_DIAG 0 /* E7a/E7b：默认关；诊断构建用编译参数 -DPPP_PHASE_DIAG=1 临时启用 */
 #endif
+
+/* E11 替代式融合：0=B 原样；1=E11-C code-only；2=E11-T code-only+TDCP。
+ * 默认关闭，避免实验代码改变正式基线。 */
+#ifndef PPP_TDCP_MODE
+#define PPP_TDCP_MODE 0
+#endif
 #if PPP_PHASE_DIAG
 #define PD_NEV  2                /* 每星每历元最多保留的排除历史事件数 */
 #define PD_NA   (-99)            /* int 型"不适用"哨兵值（写 CSV 时转空串） */
@@ -648,6 +654,134 @@ static void pd_dump_epoch(const pd_epoch_t *e,const char *ts,int ns,
         }
         fprintf(fp,"%s\n",rb);
     }
+}
+#endif
+
+#if PPP_TDCP_MODE==2
+#define TDCP_TIME_TOL 0.05
+typedef struct {
+    int week,n,clock;
+    double tow,dt,d[3],q[6],cond,wrss,scale,mineig,t1ms,t2ms;
+} tdcp_rec_t;
+typedef struct {
+    int found,provisional,applied,iter,info;
+    char reason[24];
+    tdcp_rec_t rec;
+    double z[3],innov[3],vpre[3],vpost[3];
+} tdcp_try_t;
+
+static FILE *tdcp_fp=NULL;
+static char tdcp_path[1024]="";
+static tdcp_rec_t tdcp_next;
+static int tdcp_have=0,tdcp_eof=0;
+
+static int tdcp_read_next(void)
+{
+    char line[2048];
+    int n;
+    if (!tdcp_fp) return 0;
+    while (fgets(line,sizeof(line),tdcp_fp)) {
+        n=sscanf(line,"%d,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%d,%lf,%lf,%lf,%lf,%lf,%lf,%d",
+                 &tdcp_next.week,&tdcp_next.tow,&tdcp_next.dt,
+                 tdcp_next.d,tdcp_next.d+1,tdcp_next.d+2,
+                 tdcp_next.q,tdcp_next.q+1,tdcp_next.q+2,
+                 tdcp_next.q+3,tdcp_next.q+4,tdcp_next.q+5,
+                 &tdcp_next.n,&tdcp_next.cond,&tdcp_next.wrss,
+                 &tdcp_next.scale,&tdcp_next.mineig,&tdcp_next.t1ms,
+                 &tdcp_next.t2ms,&tdcp_next.clock);
+        if (n==20) return tdcp_have=1;
+    }
+    tdcp_have=0; tdcp_eof=1;
+    return 0;
+}
+static int tdcp_open(void)
+{
+    const char *path=getenv("PPP_TDCP_CONSTRAINTS");
+    char head[2048];
+    if (!path||!*path) return 0;
+    if (tdcp_fp&&!strcmp(path,tdcp_path)) return 1;
+    if (tdcp_fp) fclose(tdcp_fp);
+    tdcp_fp=NULL; tdcp_have=tdcp_eof=0;
+    strncpy(tdcp_path,path,sizeof(tdcp_path)-1);
+    tdcp_path[sizeof(tdcp_path)-1]='\0';
+    if (!(tdcp_fp=fopen(tdcp_path,"r"))) return 0;
+    if (!fgets(head,sizeof(head),tdcp_fp)) { fclose(tdcp_fp); tdcp_fp=NULL; return 0; }
+    tdcp_read_next();
+    return 1;
+}
+static int tdcp_spd(const tdcp_rec_t *r)
+{
+    double a=r->q[0],b=r->q[1],c=r->q[2],d=r->q[3],e=r->q[4],f=r->q[5];
+    double det=a*(d*f-e*e)-b*(b*f-c*e)+c*(b*e-c*d);
+    return isfinite(a)&&isfinite(b)&&isfinite(c)&&isfinite(d)&&isfinite(e)&&
+           isfinite(f)&&a>0.0&&a*d-b*b>0.0&&det>0.0;
+}
+static int tdcp_lookup(gtime_t time,tdcp_rec_t *rec,char *reason)
+{
+    double dt;
+    if (!tdcp_open()) { strcpy(reason,"no_file"); return 0; }
+    while (tdcp_have) {
+        dt=timediff(gpst2time(tdcp_next.week,tdcp_next.tow),time);
+        if (dt>=-TDCP_TIME_TOL) break;
+        tdcp_read_next();
+    }
+    if (!tdcp_have) { strcpy(reason,tdcp_eof?"eof":"no_record"); return 0; }
+    dt=timediff(gpst2time(tdcp_next.week,tdcp_next.tow),time);
+    if (fabs(dt)>TDCP_TIME_TOL) { strcpy(reason,"no_match"); return 0; }
+    *rec=tdcp_next;
+    if (!(rec->dt>=0.5&&rec->dt<=1.5)) { strcpy(reason,"bad_dt"); return 0; }
+    if (!tdcp_spd(rec)) { strcpy(reason,"bad_cov"); return 0; }
+    strcpy(reason,"ok");
+    return 1;
+}
+static int tdcp_update(gtime_t time,const prcopt_t *opt,double *x,double *P,
+                       int nx,int iter,tdcp_try_t *out)
+{
+    double *H=zeros(nx,3),v[3],R[9]={0};
+    int i,info;
+    memset(out,0,sizeof(*out)); out->iter=iter;
+    if (!opt->dynamics||nx<9) { strcpy(out->reason,"no_dynamics"); free(H); return 0; }
+    if (!tdcp_lookup(time,&out->rec,out->reason)) { free(H); return 0; }
+    out->found=1;
+    for (i=0;i<3;i++) {
+        out->z[i]=out->rec.d[i]/out->rec.dt;
+        out->vpre[i]=x[3+i];
+        out->innov[i]=out->z[i]-(x[3+i]-0.5*out->rec.dt*x[6+i]);
+        v[i]=out->innov[i];
+        H[(3+i)+i*nx]=1.0;
+        H[(6+i)+i*nx]=-0.5*out->rec.dt;
+    }
+    R[0]=out->rec.q[0]/SQR(out->rec.dt);
+    R[1]=R[3]=out->rec.q[1]/SQR(out->rec.dt);
+    R[2]=R[6]=out->rec.q[2]/SQR(out->rec.dt);
+    R[4]=out->rec.q[3]/SQR(out->rec.dt);
+    R[5]=R[7]=out->rec.q[4]/SQR(out->rec.dt);
+    R[8]=out->rec.q[5]/SQR(out->rec.dt);
+    info=filter(x,P,H,v,R,nx,3); free(H); out->info=info;
+    if (info) { strcpy(out->reason,"filter_error"); return 0; }
+    for (i=0;i<3;i++) out->vpost[i]=x[3+i];
+    out->provisional=1;
+    return 1;
+}
+static void tdcp_dump(gtime_t time,const tdcp_try_t *r)
+{
+    const char *path=getenv("PPP_TDCP_DIAG_OUT");
+    FILE *fp;
+    int week,i;
+    double tow=time2gpst(time,&week);
+    if (!path||!*path) return;
+    if (!(fp=fopen(path,"a+"))) return;
+    fseek(fp,0,SEEK_END); /* 每历元重新打开时先定位末尾，避免重复写 CSV 表头 */
+    if (ftell(fp)==0) fprintf(fp,"week,tow,found,applied,reason,iter,dt,dx,dy,dz,qxx,qxy,qxz,qyy,qyz,qzz,zx,zy,zz,innov_x,innov_y,innov_z,vpre_x,vpre_y,vpre_z,vpost_x,vpost_y,vpost_z,info\n");
+    fprintf(fp,"%d,%.3f,%d,%d,%s,%d",week,tow,r->found,r->applied,r->reason,r->iter);
+    if (r->found) fprintf(fp,",%.6f,%.9f,%.9f,%.9f,%.12g,%.12g,%.12g,%.12g,%.12g,%.12g,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%d\n",
+        r->rec.dt,r->rec.d[0],r->rec.d[1],r->rec.d[2],r->rec.q[0],r->rec.q[1],r->rec.q[2],r->rec.q[3],r->rec.q[4],r->rec.q[5],
+        r->z[0],r->z[1],r->z[2],r->innov[0],r->innov[1],r->innov[2],r->vpre[0],r->vpre[1],r->vpre[2],r->vpost[0],r->vpost[1],r->vpost[2],r->info);
+    else {
+        for (i=0;i<22;i++) fprintf(fp,",");
+        fprintf(fp,",%d\n",r->info);
+    }
+    fclose(fp);
 }
 #endif
 
@@ -1826,6 +1960,10 @@ static int ppp_res(
             code=j%2;     /* 偶数 j 是载波相位，奇数 j 是伪距 */
             frq=j/2;      /* j=0/1 对应频率 0，j=2/3 对应频率 1 */
 
+#if PPP_TDCP_MODE>=1
+            if (code==0) continue; /* E11-C/T：原始相位不进入 PPP 更新，避免与 TDCP 重复 */
+#endif
+
             if (opt->ionoopt==IONOOPT_IFLC) { /* 无电离层组合模式只使用 Lc/Pc */
                 if ((y=code==0?Lc:Pc)==0.0) { /* 缺少组合观测就跳过 */
 #if PPP_PHASE_DIAG
@@ -1954,7 +2092,11 @@ static int ppp_res(
                 }
 #endif
             }
+#if PPP_TDCP_MODE>=1
+            if (code==1) rtk->ssat[sat-1].vsat[frq]=1; /* E11-C/T：以成功入列的 code 星维持解状态计数 */
+#else
             if (code==0) rtk->ssat[sat-1].vsat[frq]=1; /* 相位残差成功入列，标记该星该频率有效 */
+#endif
 #if PPP_PHASE_DIAG
             if (pd&&pd_iter>=0&&code==0&&H) { /* E7a：相位行真正进入滤波（仅 pre-fit pass） */
                 int m2;
@@ -2124,6 +2266,9 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
     pd_epoch_t pd_e;       /* E7a：历元级诊断 */
     pd_update_t pdu_a,pdu_k; /* E7b：当前尝试/最终验收的一步删组重算结果 */
 #endif
+#if PPP_TDCP_MODE==2
+    tdcp_try_t td_a,td_k;
+#endif
     int svh[MAXOBS];      /* 每条观测对应卫星的健康状态标记 */
     int exc[MAXOBS]={0};  /* 卫星排除标记：0=暂不排除，1=排除；初始全部为 0 */
     int stat=SOLQ_SINGLE; /* 当前解状态先设为单点解，PPP 成功后再升级为 PPP 解 */
@@ -2178,6 +2323,10 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
 #if PPP_PHASE_DIAG
     memset(&pdu_a,0,sizeof(pdu_a)); memset(&pdu_k,0,sizeof(pdu_k));
 #endif
+#if PPP_TDCP_MODE==2
+    memset(&td_a,0,sizeof(td_a)); memset(&td_k,0,sizeof(td_k));
+    strcpy(td_k.reason,"not_attempted"); td_k.iter=-1;
+#endif
 
     for (i=0;i<MAX_ITER;i++) { /* 最多尝试 MAX_ITER（本版本为 8）次滤波和残差检查 */
 
@@ -2188,6 +2337,9 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
 #endif
         matcpy(xp,rtk->x,rtk->nx,1);           /* 把正式预测状态 rtk->x 复制到临时状态 xp */
         matcpy(Pp,rtk->P,rtk->nx,rtk->nx);     /* 把正式协方差 rtk->P 复制到临时协方差 Pp */
+#if PPP_TDCP_MODE==2
+        tdcp_update(obs[0].time,opt,xp,Pp,rtk->nx,i,&td_a); /* E11-T：临时状态上的 TDCP 更新 */
+#endif
 
       /* prefit residuals    验前残差 → filter更新 → 验后残差检查
                                                       ↓
@@ -2229,6 +2381,9 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
             matcpy(rtk->x,xp,rtk->nx,1);       /* 验后检查通过：把临时状态 xp 写回正式状态 rtk->x */
             matcpy(rtk->P,Pp,rtk->nx,rtk->nx); /* 把临时协方差 Pp 写回正式协方差 rtk->P */
             stat=SOLQ_PPP;                     /* 将本历元解状态标记为 PPP 浮点解 */
+#if PPP_TDCP_MODE==2
+            td_k=td_a; td_k.applied=td_a.provisional; /* 仅验收迭代计为已应用 */
+#endif
 #if PPP_PHASE_DIAG
             pd_e.proc=PD_PROC_PPP; pd_e.acc_iter=i;
             pd_accept(pd_d,n,exc,i);           /* 只有验收通过的迭代才复制 attempt→accepted */
@@ -2282,6 +2437,10 @@ extern void pppos(       /* 一句话理解 pppos()：接收观测与导航数�
     free(v);    /* 释放残差向量 */
     free(H);    /* 释放设计矩阵 */
     free(R);    /* 释放观测噪声协方差矩阵 */
+#if PPP_TDCP_MODE==2
+    if (stat!=SOLQ_PPP&&stat!=SOLQ_FIX) td_k=td_a;
+    tdcp_dump(obs[0].time,&td_k);
+#endif
 #if PPP_PHASE_DIAG
     { /* E7a：历元末落盘（成功与失败历元都记录；ns=相位有效星数） */
         int k,ns0=0;
